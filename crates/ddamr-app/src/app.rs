@@ -6,11 +6,14 @@
 //! y el resultado vuelve como un `Message`.
 use crate::virtual_list::{ThumbCache, page_slice};
 use ddamr_core::{
-    Config, FileFilter, Page, PageResult, SafePath, SortKey, SortOrder, format_size,
+    AppError, Config, FileFilter, Page, PageResult, SafePath, SortKey, SortOrder, format_size,
     format_timestamp_ms,
 };
 use ddamr_fs::{
-    DirNode, DirState, FileEntry, find_node_mut, list_dir, load_children, visible_nodes,
+    DirNode, DirState, FileEntry, SafeOp, find_node_mut, list_dir, load_children, visible_nodes,
+};
+use ddamr_index::{
+    DuplicateGroup, DuplicateKind, FileInfo, default_db_path, find_duplicates_with_root,
 };
 use ddamr_metadata::{BasicMetadata, read_basic};
 use iced::keyboard::{Key, key::Named};
@@ -18,6 +21,41 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input}
 use iced::{Element, Length, Task};
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+/// Vista principal: el explorador de la fase 1 o la vista de
+/// duplicados de la fase 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    #[default]
+    Browser,
+    Duplicates,
+}
+
+/// Diálogo de confirmación abierto (overlay). La papelera nunca se
+/// ejecuta sin confirmar: es el único `ConfirmKind` de la fase 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    Trash,
+}
+
+/// Filtro de grupos de duplicados.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DupFilter {
+    #[default]
+    All,
+    Exact,
+    ImageDHash,
+    VideoDHash,
+}
+
+/// Orden de los grupos de duplicados.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DupSort {
+    #[default]
+    Space,
+    Count,
+    Name,
+}
 
 /// Modo de visualización del panel central. En fase 1 solo lista;
 /// la rejilla de miniaturas llegará con el widget virtualizado.
@@ -46,6 +84,34 @@ pub enum Message {
     KeyPressed(Key),
     /// Metadatos del archivo seleccionado, cargados en segundo plano.
     SelectedMetadataLoaded(BasicMetadata),
+    // ---- Vista de duplicados (fase 2) ----
+    ShowBrowser,
+    ShowDuplicates,
+    DuplicatesLoaded(Vec<DuplicateGroup>),
+    ToggleDuplicateGroup(usize),
+    ExpandAllDuplicates,
+    CollapseAllDuplicates,
+    ToggleDuplicateFile(usize, usize),
+    /// Selecciona el archivo más antiguo del grupo (por fecha de
+    /// creación; a igualdad, el primero por nombre).
+    SelectOldest(usize),
+    /// Selecciona el archivo más reciente del grupo.
+    SelectNewest(usize),
+    SetDupFilter(DupFilter),
+    SetDupSort(DupSort),
+    SetMoveDest(String),
+    TrashSelected,
+    MoveSelected,
+    ArchiveSelected,
+    DeselectAll,
+    ConfirmTrash,
+    CancelDialog,
+    /// Resultado de enviar los seleccionados a la papelera.
+    TrashDone(usize, Vec<String>),
+    /// Resultado de mover los seleccionados (movidos, fallos).
+    MoveDone(Vec<String>, Vec<String>),
+    /// Resultado de archivar (archivados, sin fecha).
+    ArchiveDone(usize, usize),
 }
 
 pub struct App {
@@ -66,6 +132,18 @@ pub struct App {
     /// Caché LRU de miniaturas, lista para la iteración que las dibuje.
     #[allow(dead_code)]
     pub thumb_cache: ThumbCache,
+    // ---- Vista de duplicados (fase 2) ----
+    pub view: View,
+    pub confirm_dialog: Option<ConfirmKind>,
+    pub duplicates: Vec<DuplicateGroup>,
+    pub duplicates_loading: bool,
+    pub collapsed_groups: HashSet<usize>,
+    /// (grupo, archivo) seleccionados en la vista de duplicados.
+    pub dup_selected: HashSet<(usize, usize)>,
+    pub dup_filter: DupFilter,
+    pub dup_sort: DupSort,
+    /// Destino de "Mover seleccionados", como texto validado con SafePath.
+    pub move_dest: String,
 }
 
 impl Default for App {
@@ -98,6 +176,15 @@ impl Default for App {
             view_mode: ViewMode::List,
             selected_metadata: None,
             thumb_cache: ThumbCache::new(128),
+            view: View::Browser,
+            confirm_dialog: None,
+            duplicates: Vec::new(),
+            duplicates_loading: false,
+            collapsed_groups: HashSet::new(),
+            dup_selected: HashSet::new(),
+            dup_filter: DupFilter::All,
+            dup_sort: DupSort::Space,
+            move_dest: String::new(),
         }
     }
 }
@@ -162,6 +249,93 @@ impl App {
             self.selected.remove(entry.path.path());
         }
         Task::none()
+    }
+
+    // ---- Duplicados (fase 2) ----
+
+    /// Carga los duplicados en un Task: abre la DB y busca con la
+    /// raíz, calculando los hashes que falten.
+    fn load_duplicates_task(&self) -> Task<Message> {
+        let root = self.root.clone();
+        Task::perform(
+            async move {
+                let conn = ddamr_db::open(&default_db_path())
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| find_duplicates_with_root(&c, &root).map_err(|e| e.to_string()));
+                conn.unwrap_or_default()
+            },
+            Message::DuplicatesLoaded,
+        )
+    }
+
+    /// Archivos seleccionados en la vista de duplicados, con su
+    /// (grupo, índice) para poder quitarlos de la selección tras
+    /// actuar sobre ellos.
+    fn selected_dup_files(&self) -> Vec<(usize, usize, FileInfo)> {
+        let mut out = Vec::new();
+        for &(g, i) in &self.dup_selected {
+            if let Some(f) = self.duplicates.get(g).and_then(|gr| gr.files.get(i)) {
+                out.push((g, i, f.clone()));
+            }
+        }
+        out.sort_by_key(|(g, i, _)| (*g, *i));
+        out
+    }
+
+    /// Índice del archivo más antiguo / más reciente de un grupo,
+    /// por fecha de creación (sin fecha se trata como la más
+    /// antigua); desempata por nombre.
+    fn oldest_in_group(&self, group: usize) -> Option<usize> {
+        self.duplicates.get(group).and_then(|g| {
+            g.files
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, f)| (f.created_at.unwrap_or(i64::MIN), f.name.clone()))
+                .map(|(i, _)| i)
+        })
+    }
+
+    fn newest_in_group(&self, group: usize) -> Option<usize> {
+        self.duplicates.get(group).and_then(|g| {
+            g.files
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, f)| (f.created_at.unwrap_or(i64::MIN), f.name.clone()))
+                .map(|(i, _)| i)
+        })
+    }
+
+    /// Grupos visibles según filtro y orden. Devuelve índices en el
+    /// orden de presentación (no se reordena el vector guardado).
+    fn visible_dup_groups(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .duplicates
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| match self.dup_filter {
+                DupFilter::All => true,
+                DupFilter::Exact => g.kind == DuplicateKind::Exact,
+                DupFilter::ImageDHash => g.kind == DuplicateKind::ImageDHash,
+                DupFilter::VideoDHash => g.kind == DuplicateKind::VideoDHash,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match self.dup_sort {
+            DupSort::Space => {
+                idx.sort_by_key(|&i| std::cmp::Reverse(self.duplicates[i].total_bytes))
+            }
+            DupSort::Count => {
+                idx.sort_by_key(|&i| std::cmp::Reverse(self.duplicates[i].files.len()));
+            }
+            DupSort::Name => idx.sort_by_key(|&i| {
+                self.duplicates[i]
+                    .files
+                    .first()
+                    .map(|f| f.name.clone())
+                    .unwrap_or_default()
+            }),
+        }
+        idx
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -292,6 +466,249 @@ impl App {
                 self.selected_metadata = Some(meta);
                 Task::none()
             }
+            // ---- Duplicados (fase 2) ----
+            Message::ShowBrowser => {
+                self.view = View::Browser;
+                Task::none()
+            }
+            Message::ShowDuplicates => {
+                self.view = View::Duplicates;
+                self.duplicates_loading = true;
+                self.status_msg = "Buscando duplicados…".into();
+                self.load_duplicates_task()
+            }
+            Message::DuplicatesLoaded(groups) => {
+                let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+                self.duplicates = groups;
+                self.duplicates_loading = false;
+                self.collapsed_groups.clear();
+                self.dup_selected.clear();
+                self.status_msg = format!(
+                    "{} grupos de duplicados · {} archivos",
+                    self.duplicates.len(),
+                    total_files
+                );
+                Task::none()
+            }
+            Message::ToggleDuplicateGroup(i) => {
+                if !self.collapsed_groups.remove(&i) {
+                    self.collapsed_groups.insert(i);
+                }
+                Task::none()
+            }
+            Message::ExpandAllDuplicates => {
+                self.collapsed_groups.clear();
+                Task::none()
+            }
+            Message::CollapseAllDuplicates => {
+                self.collapsed_groups = (0..self.duplicates.len()).collect();
+                Task::none()
+            }
+            Message::ToggleDuplicateFile(g, i) => {
+                if !self.dup_selected.remove(&(g, i)) {
+                    self.dup_selected.insert((g, i));
+                }
+                Task::none()
+            }
+            Message::SelectOldest(g) => {
+                if let Some(i) = self.oldest_in_group(g) {
+                    self.dup_selected.insert((g, i));
+                }
+                Task::none()
+            }
+            Message::SelectNewest(g) => {
+                if let Some(i) = self.newest_in_group(g) {
+                    self.dup_selected.insert((g, i));
+                }
+                Task::none()
+            }
+            Message::SetDupFilter(f) => {
+                self.dup_filter = f;
+                Task::none()
+            }
+            Message::SetDupSort(s) => {
+                self.dup_sort = s;
+                Task::none()
+            }
+            Message::SetMoveDest(s) => {
+                self.move_dest = s;
+                Task::none()
+            }
+            Message::TrashSelected => {
+                if self.dup_selected.is_empty() {
+                    self.status_msg = "No hay archivos seleccionados.".into();
+                    Task::none()
+                } else {
+                    // La papelera nunca se ejecuta sin confirmar.
+                    self.confirm_dialog = Some(ConfirmKind::Trash);
+                    Task::none()
+                }
+            }
+            Message::ConfirmTrash => {
+                let Some(ConfirmKind::Trash) = self.confirm_dialog else {
+                    return Task::none();
+                };
+                self.confirm_dialog = None;
+                let files = self.selected_dup_files();
+                let root = self.root.clone();
+                Task::perform(
+                    async move {
+                        let ops = SafeOp::new(&root);
+                        let mut done = 0usize;
+                        let mut errors: Vec<String> = Vec::new();
+                        for (_, _, f) in files {
+                            match root.join(std::path::Path::new(&f.path)) {
+                                Ok(p) => match ops.trash_file(&p) {
+                                    Ok(()) => done += 1,
+                                    Err(e) => errors.push(format!("{}: {e}", f.path)),
+                                },
+                                Err(e) => errors.push(format!("{}: {e}", f.path)),
+                            }
+                        }
+                        Message::TrashDone(done, errors)
+                    },
+                    |m| m,
+                )
+            }
+            Message::CancelDialog => {
+                self.confirm_dialog = None;
+                Task::none()
+            }
+            Message::TrashDone(done, errors) => {
+                self.dup_selected.clear();
+                if errors.is_empty() {
+                    self.status_msg = format!("{done} archivos enviados a la papelera.");
+                } else {
+                    self.status_msg = format!(
+                        "{done} a la papelera · {} errores: {}",
+                        errors.len(),
+                        errors.join("; ")
+                    );
+                }
+                self.duplicates_loading = true;
+                self.load_duplicates_task()
+            }
+            Message::MoveSelected => {
+                if self.dup_selected.is_empty() {
+                    self.status_msg = "No hay archivos seleccionados.".into();
+                    return Task::none();
+                }
+                let dest_text = self.move_dest.trim().to_string();
+                if dest_text.is_empty() {
+                    self.status_msg = "Escribe la carpeta destino para mover.".into();
+                    return Task::none();
+                }
+                let Ok(dest_dir) = SafePath::new(self.root.root(), &PathBuf::from(&dest_text))
+                else {
+                    self.status_msg =
+                        format!("La ruta destino {dest_text:?} no está dentro de la raíz.");
+                    return Task::none();
+                };
+                if !dest_dir.path().is_dir() {
+                    self.status_msg = format!(
+                        "La carpeta destino {} no existe.",
+                        dest_dir.path().display()
+                    );
+                    return Task::none();
+                }
+                let files = self.selected_dup_files();
+                let root = self.root.clone();
+                Task::perform(
+                    async move {
+                        let ops = SafeOp::new(&root);
+                        let mut moved: Vec<String> = Vec::new();
+                        let mut failed: Vec<String> = Vec::new();
+                        for (_, _, f) in files {
+                            let src = match root.join(std::path::Path::new(&f.path)) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    failed.push(format!("{}: {e}", f.path));
+                                    continue;
+                                }
+                            };
+                            let dst_path = dest_dir.path().join(&f.name);
+                            match SafePath::new(root.root(), &dst_path) {
+                                Ok(dst) => match ops.move_file(&src, &dst) {
+                                    Ok(_) => moved.push(f.path.clone()),
+                                    Err(e) => failed.push(format!("{}: {e}", f.path)),
+                                },
+                                Err(e) => failed.push(format!("{}: {e}", f.path)),
+                            }
+                        }
+                        Message::MoveDone(moved, failed)
+                    },
+                    |m| m,
+                )
+            }
+            Message::MoveDone(moved, failed) => {
+                self.dup_selected.clear();
+                if failed.is_empty() {
+                    self.status_msg = format!("{} archivos movidos.", moved.len());
+                } else {
+                    self.status_msg = format!(
+                        "{} movidos · {} fallos: {}",
+                        moved.len(),
+                        failed.len(),
+                        failed.join("; ")
+                    );
+                }
+                self.duplicates_loading = true;
+                self.load_duplicates_task()
+            }
+            Message::ArchiveSelected => {
+                if self.dup_selected.is_empty() {
+                    self.status_msg = "No hay archivos seleccionados.".into();
+                    return Task::none();
+                }
+                let files = self.selected_dup_files();
+                let root = self.root.clone();
+                let archive_root = match SafePath::new(root.root(), &self.config.archive_dir) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.status_msg = format!("El archivado no es válido: {e}");
+                        return Task::none();
+                    }
+                };
+                Task::perform(
+                    async move {
+                        let ops = SafeOp::new(&root);
+                        let mut done = 0usize;
+                        let mut no_date = 0usize;
+                        for (_, _, f) in files {
+                            // Fecha de los metadatos ya indexados; sin
+                            // fecha no se mueve: se cuenta (NoDate).
+                            let date = f.created_at.and_then(ym_from_ms);
+                            let Ok(src) = root.join(std::path::Path::new(&f.path)) else {
+                                continue;
+                            };
+                            match ops.archive_file(&src, &archive_root, date) {
+                                Ok(_) => done += 1,
+                                Err(AppError::NoDate(_)) => no_date += 1,
+                                Err(_) => no_date += 1,
+                            }
+                        }
+                        Message::ArchiveDone(done, no_date)
+                    },
+                    |m| m,
+                )
+            }
+            Message::ArchiveDone(done, no_date) => {
+                self.dup_selected.clear();
+                self.status_msg = if no_date == 0 {
+                    format!("{done} archivos archivados.")
+                } else {
+                    format!(
+                        "{done} archivos archivados · No se pudieron archivar {no_date} archivos (sin fecha)."
+                    )
+                };
+                self.duplicates_loading = true;
+                self.load_duplicates_task()
+            }
+            Message::DeselectAll => {
+                self.dup_selected.clear();
+                self.selected.clear();
+                Task::none()
+            }
         }
     }
 
@@ -403,7 +820,161 @@ impl App {
         .into()
     }
 
+    /// Vista de duplicados: grupos colapsables con preview,
+    /// filtros, orden y barra de selección. La columna de info
+    /// sigue en solo lectura (el formulario de edición es fase 2b).
+    fn duplicates_view(&self) -> Element<'_, Message> {
+        let filter_btn = |f: DupFilter, label: &str| {
+            let mark = if self.dup_filter == f { "● " } else { "○ " };
+            button(text(format!("{mark}{label}")).size(12)).on_press(Message::SetDupFilter(f))
+        };
+        let sort_btn = |s: DupSort, label: &str| {
+            let mark = if self.dup_sort == s { "● " } else { "○ " };
+            button(text(format!("{mark}{label}")).size(12)).on_press(Message::SetDupSort(s))
+        };
+        let mut col = column![
+            row![
+                button(text("◀ Explorador").size(12)).on_press(Message::ShowBrowser),
+                text("Duplicados").size(14),
+                button(text("Buscar de nuevo").size(12)).on_press(Message::ShowDuplicates),
+            ]
+            .spacing(8),
+            row![
+                filter_btn(DupFilter::All, "Todos"),
+                filter_btn(DupFilter::Exact, "Exactos"),
+                filter_btn(DupFilter::ImageDHash, "dHash imagen"),
+                filter_btn(DupFilter::VideoDHash, "dHash vídeo"),
+            ]
+            .spacing(6),
+            row![
+                text("Orden:").size(12),
+                sort_btn(DupSort::Space, "Espacio total"),
+                sort_btn(DupSort::Count, "Nº de duplicados"),
+                sort_btn(DupSort::Name, "Nombre"),
+                button(text("Expandir todos").size(12)).on_press(Message::ExpandAllDuplicates),
+                button(text("Colapsar todos").size(12)).on_press(Message::CollapseAllDuplicates),
+            ]
+            .spacing(6),
+        ]
+        .spacing(6);
+        if self.duplicates_loading {
+            col = col.push(text("Buscando duplicados…").size(13));
+        } else if self.duplicates.is_empty() {
+            col = col.push(text("Sin duplicados en la base de datos.").size(13));
+        }
+        for g_idx in self.visible_dup_groups() {
+            let g = &self.duplicates[g_idx];
+            let kind_label = match g.kind {
+                DuplicateKind::Exact => "Exactos",
+                DuplicateKind::ImageDHash => "Similares (imagen)",
+                DuplicateKind::VideoDHash => "Similares (vídeo)",
+            };
+            let collapsed = self.collapsed_groups.contains(&g_idx);
+            let icon = if collapsed { "[>]" } else { "[v]" };
+            let header = row![
+                button(text(icon).size(13)).on_press(Message::ToggleDuplicateGroup(g_idx)),
+                text(format!(
+                    "{kind_label} · {} archivos · {}",
+                    g.files.len(),
+                    format_size(g.total_bytes)
+                ))
+                .size(13),
+                button(text("Más antiguo").size(12)).on_press(Message::SelectOldest(g_idx)),
+                button(text("Más nuevo").size(12)).on_press(Message::SelectNewest(g_idx)),
+            ]
+            .spacing(6);
+            col = col.push(header);
+            if !collapsed {
+                for (f_idx, f) in g.files.iter().enumerate() {
+                    let mark = if self.dup_selected.contains(&(g_idx, f_idx)) {
+                        "✓ "
+                    } else {
+                        "○ "
+                    };
+                    let dims = match (f.width, f.height) {
+                        (Some(w), Some(h)) => format!("{w}×{h}"),
+                        _ => "-".into(),
+                    };
+                    let dur = match f.duration_ms {
+                        Some(ms) => format!("{} s", ms / 1000),
+                        None => "-".into(),
+                    };
+                    let date = f
+                        .created_at
+                        .map(|ts| format_timestamp_ms(Some(ts)))
+                        .unwrap_or_else(|| "-".into());
+                    let line = format!(
+                        "{mark}{}  {}  {}  {}  {}",
+                        f.name,
+                        format_size(f.size_bytes),
+                        dims,
+                        dur,
+                        date
+                    );
+                    let file_row = row![
+                        button(text(line).size(12))
+                            .on_press(Message::ToggleDuplicateFile(g_idx, f_idx))
+                            .width(Length::Fill),
+                        text(f.path.clone()).size(11),
+                    ]
+                    .spacing(6);
+                    col = col.push(file_row);
+                }
+            }
+        }
+        // Barra inferior de selección (solo si hay selección).
+        if !self.dup_selected.is_empty() {
+            col = col.push(self.selection_bar());
+        }
+        // Diálogo de confirmación de papelera (overlay en columna).
+        if let Some(ConfirmKind::Trash) = self.confirm_dialog {
+            col = col.push(
+                container(
+                    column![
+                        text(format!(
+                            "¿Enviar {} archivos seleccionados a la papelera?",
+                            self.dup_selected.len()
+                        ))
+                        .size(13),
+                        row![
+                            button(text("Sí, a la papelera").size(12))
+                                .on_press(Message::ConfirmTrash),
+                            button(text("Cancelar").size(12)).on_press(Message::CancelDialog),
+                        ]
+                        .spacing(8),
+                    ]
+                    .spacing(6),
+                )
+                .padding(10),
+            );
+        }
+        scrollable(col).width(Length::Fill).into()
+    }
+
+    /// Barra inferior: mover / archivar / papelera / deseleccionar.
+    fn selection_bar(&self) -> Element<'_, Message> {
+        row![
+            text(format!("{} seleccionados", self.dup_selected.len())).size(12),
+            text_input("Carpeta destino dentro de la raíz…", &self.move_dest)
+                .on_input(Message::SetMoveDest)
+                .width(Length::Fixed(220.0)),
+            button(text("Mover").size(12)).on_press(Message::MoveSelected),
+            button(text("Archivar").size(12)).on_press(Message::ArchiveSelected),
+            button(text("Papelera…").size(12)).on_press(Message::TrashSelected),
+            button(text("Deseleccionar todo").size(12)).on_press(Message::DeselectAll),
+        ]
+        .spacing(6)
+        .into()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
+        if self.view == View::Duplicates {
+            let status = text(&self.status_msg).size(12);
+            return column![self.duplicates_view(), status]
+                .spacing(6)
+                .padding(8)
+                .into();
+        }
         let sort_label = |key: SortKey, label: &str| {
             let arrow = if self.sort == key {
                 match self.sort_order {
@@ -429,6 +1000,7 @@ impl App {
             button(text(sort_label(SortKey::Date, "Fecha")).size(12))
                 .on_press(Message::SetSort(SortKey::Date)),
             button(text("Recargar").size(12)).on_press(Message::Refresh),
+            button(text("Duplicados").size(12)).on_press(Message::ShowDuplicates),
         ]
         .spacing(6);
         let filters = row![
@@ -489,6 +1061,26 @@ impl App {
         .padding(8)
         .into()
     }
+}
+
+/// (año, mes) UTC de un timestamp en milisegundos, sin
+/// dependencias externas (inverso de `days_from_civil`).
+fn ym_from_ms(ms: i64) -> Option<(u32, u32)> {
+    let days = ms.div_euclid(86_400_000);
+    // civil from days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    if !(1970..=2100).contains(&year) {
+        return None;
+    }
+    Some((year as u32, m as u32))
 }
 
 #[cfg(test)]
@@ -612,5 +1204,139 @@ mod tests {
         assert!(!app.filter.hide_folders);
         let _ = app.update(Message::ToggleOnlyMedia);
         assert!(!app.filter.only_media);
+    }
+
+    // ---- Fase 2: vista de duplicados ----
+
+    fn file_info(name: &str, created_at: Option<i64>) -> FileInfo {
+        FileInfo {
+            path: name.to_string(),
+            name: name.to_string(),
+            size_bytes: 100,
+            kind: ddamr_core::MediaKind::Image,
+            hash_blake3: None,
+            dhash_image: None,
+            dhash_video: None,
+            width: Some(64),
+            height: Some(64),
+            duration_ms: None,
+            created_at,
+            modified_at: created_at,
+        }
+    }
+
+    fn app_with_duplicates() -> App {
+        App {
+            duplicates: vec![DuplicateGroup {
+                kind: DuplicateKind::Exact,
+                files: vec![
+                    file_info("vieja.jpg", Some(1_000_000)),
+                    file_info("nueva.jpg", Some(2_000_000)),
+                ],
+                total_bytes: 200,
+            }],
+            ..App::default()
+        }
+    }
+
+    #[test]
+    fn show_duplicates_and_loaded_groups() {
+        let mut app = app_with_duplicates();
+        let _ = app.update(Message::ShowDuplicates);
+        assert_eq!(app.view, View::Duplicates);
+        assert!(app.duplicates_loading);
+        let groups = vec![DuplicateGroup {
+            kind: DuplicateKind::Exact,
+            files: vec![file_info("a.jpg", None), file_info("b.jpg", None)],
+            total_bytes: 200,
+        }];
+        let _ = app.update(Message::DuplicatesLoaded(groups));
+        assert!(!app.duplicates_loading);
+        assert_eq!(app.duplicates.len(), 1);
+        assert_eq!(app.duplicates[0].files.len(), 2);
+        assert!(app.status_msg.contains("1 grupos"));
+    }
+
+    #[test]
+    fn toggle_duplicate_group_collapses_and_expands() {
+        let mut app = app_with_duplicates();
+        let _ = app.update(Message::ToggleDuplicateGroup(0));
+        assert!(app.collapsed_groups.contains(&0));
+        let _ = app.update(Message::ToggleDuplicateGroup(0));
+        assert!(!app.collapsed_groups.contains(&0));
+        let _ = app.update(Message::CollapseAllDuplicates);
+        assert!(app.collapsed_groups.contains(&0));
+        let _ = app.update(Message::ExpandAllDuplicates);
+        assert!(app.collapsed_groups.is_empty());
+    }
+
+    #[test]
+    fn select_oldest_and_newest_pick_by_date() {
+        let mut app = app_with_duplicates();
+        let _ = app.update(Message::SelectOldest(0));
+        assert!(
+            app.dup_selected.contains(&(0, 0)),
+            "el más antiguo es vieja.jpg"
+        );
+        assert!(!app.dup_selected.contains(&(0, 1)));
+        let _ = app.update(Message::SelectNewest(0));
+        assert!(
+            app.dup_selected.contains(&(0, 1)),
+            "el más nuevo es nueva.jpg"
+        );
+        let _ = app.update(Message::ToggleDuplicateFile(0, 0));
+        assert!(!app.dup_selected.contains(&(0, 0)));
+        let _ = app.update(Message::DeselectAll);
+        assert!(app.dup_selected.is_empty());
+    }
+
+    #[test]
+    fn trash_requires_confirmation_dialog() {
+        let mut app = app_with_duplicates();
+        // Sin selección no se abre el diálogo.
+        let _ = app.update(Message::TrashSelected);
+        assert!(app.confirm_dialog.is_none());
+        let _ = app.update(Message::SelectOldest(0));
+        let _ = app.update(Message::TrashSelected);
+        assert_eq!(app.confirm_dialog, Some(ConfirmKind::Trash));
+        let _ = app.update(Message::CancelDialog);
+        assert!(app.confirm_dialog.is_none());
+        // Confirmar cierra el diálogo (la papelera va por Task).
+        let _ = app.update(Message::TrashSelected);
+        let _ = app.update(Message::ConfirmTrash);
+        assert!(app.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn move_selected_without_dest_is_rejected() {
+        let mut app = app_with_duplicates();
+        let _ = app.update(Message::SelectOldest(0));
+        let _ = app.update(Message::MoveSelected);
+        assert!(app.status_msg.contains("destino"));
+        let _ = app.update(Message::SetMoveDest("/etc".into()));
+        let _ = app.update(Message::MoveSelected);
+        assert!(app.status_msg.contains("dentro de la raíz"));
+    }
+
+    #[test]
+    fn archive_done_reports_files_without_date() {
+        let mut app = app_with_duplicates();
+        let _ = app.update(Message::ArchiveDone(2, 3));
+        assert!(
+            app.status_msg
+                .contains("No se pudieron archivar 3 archivos")
+        );
+        let _ = app.update(Message::ArchiveDone(2, 0));
+        assert!(app.status_msg.contains("2 archivos archivados"));
+        assert!(!app.status_msg.contains("No se pudieron"));
+    }
+
+    #[test]
+    fn ym_from_ms_known_dates() {
+        assert_eq!(ym_from_ms(0), Some((1970, 1)));
+        // 2024-01-02 03:04:05 UTC = 1704164645 s.
+        assert_eq!(ym_from_ms(1_704_164_645_000), Some((2024, 1)));
+        // 2026-11-19 12:00 UTC = 1795128000 s.
+        assert_eq!(ym_from_ms(1_795_128_000_000), Some((2026, 11)));
     }
 }

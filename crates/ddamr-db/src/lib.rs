@@ -2,12 +2,14 @@
 //!
 //! Un solo escritor, WAL, `foreign_keys = ON` en cada conexión.
 //! Migraciones numeradas en `PRAGMA user_version`.
+pub mod repos;
+
 use ddamr_core::{AppError, MediaKind, Page, PageResult, Result, SortKey, SortOrder};
 use ddamr_fs::FileEntry;
 use rusqlite::{Connection, params};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Una fila de la tabla `files`, tal como se lee de la DB.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,15 +38,23 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Migración 001: esquema mínimo (files/tags). Las siguientes van
-/// en `match version { 1 => migrate_002, ... }` con user_version.
+/// Migraciones numeradas en `PRAGMA user_version`. Cada una corre
+/// solo si la versión actual es menor, en su propia transacción.
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| AppError::Database(e.to_string()))?;
-    if version >= SCHEMA_VERSION {
-        return Ok(());
+    if version < 1 {
+        migrate_001(conn)?;
     }
+    if version < 2 {
+        migrate_002(conn)?;
+    }
+    Ok(())
+}
+
+/// Migración 001: esquema mínimo (files/tags).
+fn migrate_001(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
@@ -69,6 +79,120 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Añade una columna solo si no existe (SQLite no tiene
+/// `ADD COLUMN IF NOT EXISTS`): se consulta `PRAGMA table_info`.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    coltype: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let columns = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let exists = columns.iter().any(|n| n == column);
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {coltype};"
+        ))
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Migración 002: ubicaciones, regiones, asociaciones, la tabla
+/// `file_tags` (la 001 creó `tags` pero no su tabla de unión) y
+/// las columnas de duplicados/dimensiones en `files`.
+fn migrate_002(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_tags (
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (file_id, tag_id)
+        );
+        CREATE TABLE IF NOT EXISTS locations (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            lat REAL NOT NULL, lon REAL NOT NULL,
+            lat_r REAL NOT NULL, lon_r REAL NOT NULL,
+            city TEXT, state TEXT, country TEXT,
+            usage_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (lat_r, lon_r)
+        );
+        CREATE TABLE IF NOT EXISTS regions (
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+            UNIQUE (file_id, name, x, y, w, h)
+        );
+        CREATE TABLE IF NOT EXISTS file_locations (
+            file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            location_id INTEGER NOT NULL REFERENCES locations(id)
+        );
+        CREATE TABLE IF NOT EXISTS associations (
+            id INTEGER PRIMARY KEY,
+            pattern TEXT NOT NULL,
+            suggestions TEXT NOT NULL
+        );",
+    )
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    for (column, coltype) in [
+        ("dhash_image", "INTEGER"),
+        ("dhash_video", "TEXT"),
+        ("width", "INTEGER"),
+        ("height", "INTEGER"),
+        ("duration_ms", "INTEGER"),
+    ] {
+        add_column_if_missing(conn, "files", column, coltype)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 2;")
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Hashes y dimensiones calculados para una fila. Solo se tocan
+/// las columnas que se pasan como `Some`.
+#[derive(Debug, Clone, Default)]
+pub struct FileHashes {
+    pub hash_blake3: Option<String>,
+    pub dhash_image: Option<i64>,
+    pub dhash_video: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<i64>,
+}
+
+/// Actualiza los hashes/dimensiones de una fila (ruta relativa).
+pub fn update_file_hashes(conn: &Connection, rel_path: &str, h: &FileHashes) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET
+            hash_blake3 = COALESCE(?2, hash_blake3),
+            dhash_image = COALESCE(?3, dhash_image),
+            dhash_video = COALESCE(?4, dhash_video),
+            width = COALESCE(?5, width),
+            height = COALESCE(?6, height),
+            duration_ms = COALESCE(?7, duration_ms)
+         WHERE path = ?1",
+        params![
+            rel_path,
+            h.hash_blake3,
+            h.dhash_image,
+            h.dhash_video,
+            h.width.map(|w| w as i64),
+            h.height.map(|h| h as i64),
+            h.duration_ms,
+        ],
+    )
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Inserta (o reemplaza) entradas en una sola transacción, en
 /// lotes de 500 sentencias preparadas. `path` se guarda relativo
 /// a la raíz, nunca absoluto. Devuelve cuántas se insertaron.
@@ -81,11 +205,25 @@ pub fn insert_files_batch(conn: &mut Connection, entries: &[FileEntry]) -> Resul
         .map_err(|e| AppError::Database(e.to_string()))?;
     let mut inserted = 0usize;
     {
+        // ON CONFLICT con COALESCE: reindexar no borra los hashes
+        // ni dimensiones ya calculados (serían NULL en la entrada).
         let mut stmt = tx
             .prepare(
-                "INSERT OR REPLACE INTO files
-                 (path, name, ext, size_bytes, created_at, modified_at, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO files
+                 (path, name, ext, size_bytes, created_at, modified_at, kind,
+                  hash_blake3, dhash_image, dhash_video, width, height, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(path) DO UPDATE SET
+                   name = excluded.name, ext = excluded.ext,
+                   size_bytes = excluded.size_bytes,
+                   created_at = excluded.created_at,
+                   modified_at = excluded.modified_at, kind = excluded.kind,
+                   hash_blake3 = COALESCE(excluded.hash_blake3, files.hash_blake3),
+                   dhash_image = COALESCE(excluded.dhash_image, files.dhash_image),
+                   dhash_video = COALESCE(excluded.dhash_video, files.dhash_video),
+                   width = COALESCE(excluded.width, files.width),
+                   height = COALESCE(excluded.height, files.height),
+                   duration_ms = COALESCE(excluded.duration_ms, files.duration_ms)",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
         for chunk in entries.chunks(500) {
@@ -98,6 +236,12 @@ pub fn insert_files_batch(conn: &mut Connection, entries: &[FileEntry]) -> Resul
                     entry.created_at,
                     entry.modified_at,
                     entry.kind.as_str(),
+                    entry.hash_blake3,
+                    entry.dhash_image,
+                    entry.dhash_video,
+                    entry.width.map(|w| w as i64),
+                    entry.height.map(|h| h as i64),
+                    entry.duration_ms,
                 ])
                 .map_err(|e| AppError::Database(e.to_string()))?;
                 inserted += 1;

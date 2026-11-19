@@ -6,6 +6,10 @@
 //! nunca miniaturas ni metadatos EXIF. Las mutaciones
 //! (mover/archivar) irán por el patrón respaldo → copia → verificar
 //! → rename atómico (fase 2).
+pub mod safe_op;
+
+pub use safe_op::{SafeOp, hash_file, resolve_collision};
+
 use ddamr_core::{
     AppError, FileFilter, MediaKind, Page, PageResult, Result, SafePath, SortKey, SortOrder,
 };
@@ -125,6 +129,15 @@ pub struct FileEntry {
     pub has_description: bool,
     /// Atributo extendido de origen (macOS). En Linux, `false`.
     pub has_xattr_origin: bool,
+    /// Dimensiones y duración cuando se conocen (el indexador las
+    /// rellena desde los metadatos; el listado en caliente no).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<i64>,
+    /// Hashes cuando ya se calcularon (el indexador/duplicados).
+    pub hash_blake3: Option<String>,
+    pub dhash_image: Option<i64>,
+    pub dhash_video: Option<String>,
     pub path: SafePath,
 }
 
@@ -165,6 +178,12 @@ impl FileEntry {
             has_location: false,
             has_description: false,
             has_xattr_origin: has_xattr_origin(&path),
+            width: None,
+            height: None,
+            duration_ms: None,
+            hash_blake3: None,
+            dhash_image: None,
+            dhash_video: None,
             path,
         })
     }

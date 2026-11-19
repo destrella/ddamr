@@ -5,6 +5,12 @@
 //! prioridades llegará en fase 2; aquí el contrato es mínimo:
 //! contar, no abortar por un archivo roto y poder cancelarse.
 
+pub mod duplicates;
+
+pub use duplicates::{
+    DuplicateGroup, DuplicateKind, FileInfo, find_duplicates, find_duplicates_with_root,
+};
+
 use ddamr_core::{AppError, Result, SafePath};
 use ddamr_db::insert_files_batch;
 use ddamr_fs::{FileEntry, walk};
@@ -111,6 +117,8 @@ impl Indexer {
                         if let Some(created) = meta.created_at {
                             fe.created_at = Some(created);
                         }
+                        fe.width = meta.width;
+                        fe.height = meta.height;
                         fe.has_keywords = meta.has_keywords;
                         fe.has_location = meta.has_location;
                         fe.has_description = meta.has_description;

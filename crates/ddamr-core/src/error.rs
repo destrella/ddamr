@@ -35,6 +35,12 @@ pub enum AppError {
     #[error("operación cancelada por el usuario")]
     Cancelled,
 
+    /// El archivo no tiene fecha (ni EXIF ni otra) para archivar.
+    /// No es un fallo del archivo: el llamador lo cuenta y deja
+    /// el original intacto, como pide el spec de archivado.
+    #[error("sin fecha para archivar: {0:?}")]
+    NoDate(PathBuf),
+
     #[error("{0}")]
     Other(String),
 }

@@ -7,7 +7,10 @@ edition = "2024"
 ddamr-core = { workspace = true }
 ddamr-db = { workspace = true }
 ddamr-fs = { workspace = true }
+ddamr-media = { workspace = true }
 ddamr-metadata = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
+image = { workspace = true }
 tempfile = { workspace = true }
