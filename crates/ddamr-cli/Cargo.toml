@@ -11,4 +11,4 @@ path = "src/main.rs"
 ddamr-core = { workspace = true }
 ddamr-db = { workspace = true }
 ddamr-fs = { workspace = true }
-# ddamr-media se añade cuando el CLI haga hash (fase 1).
+ddamr-index = { workspace = true }

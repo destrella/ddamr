@@ -3,5 +3,11 @@ name = "ddamr-index"
 version = "0.1.0"
 edition = "2024"
 
-# Sin dependencias en fase 0 (stub). core/db/fs/metadata/media
-# se añaden en fase 1, cuando la cola de jobs exista de verdad.
+[dependencies]
+ddamr-core = { workspace = true }
+ddamr-db = { workspace = true }
+ddamr-fs = { workspace = true }
+ddamr-metadata = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

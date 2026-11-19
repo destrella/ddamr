@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ddamr-core = { workspace = true }
 blake3 = "1"
+image = { version = "0.25", features = ["jpeg", "png"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

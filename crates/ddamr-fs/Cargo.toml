@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 ddamr-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

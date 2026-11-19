@@ -3,9 +3,15 @@ name = "ddamr-app"
 version = "0.1.0"
 edition = "2024"
 
-# Sin dependencias en fase 0 (stub). core/db/fs/index + iced 0.14
-# se añaden en fase 1, cuando haya UI que escribir.
-# iced 0.14 se añade en la fase 1, cuando la lista virtualizada
-# y el árbol lazy estén listos. No se compila iced en la fase 0
-# para que `cargo test` siga siendo rápido.
-# iced = "0.14"
+[[bin]]
+name = "ddamr-app"
+path = "src/main.rs"
+
+[dependencies]
+ddamr-core = { workspace = true }
+ddamr-fs = { workspace = true }
+ddamr-metadata = { workspace = true }
+iced = "0.14"
+
+[dev-dependencies]
+tempfile = { workspace = true }

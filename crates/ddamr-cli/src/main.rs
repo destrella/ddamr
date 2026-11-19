@@ -20,9 +20,16 @@ fn run(args: &[String]) -> i32 {
                 .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_default());
             scan(&dir)
         }
+        Some("index") => {
+            let dir = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_default());
+            index(&dir)
+        }
         Some("doctor") => doctor(),
         _ => {
-            eprintln!("uso: ddamr scan <dir> | ddamr doctor");
+            eprintln!("uso: ddamr scan <dir> | ddamr index <dir> | ddamr doctor");
             2
         }
     }
@@ -63,6 +70,42 @@ fn scan(dir: &std::path::Path) -> i32 {
         }
         Err(e) => {
             eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+fn index(dir: &std::path::Path) -> i32 {
+    let config = Config::default();
+    let safe = match SafePath::new(&config.root_dir, dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let db_path = ddamr_index::default_db_path();
+    if let Some(parent) = db_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("error: no se pudo crear {}: {e}", parent.display());
+        return 1;
+    }
+    println!(
+        "indexando {} en {}",
+        safe.path().display(),
+        db_path.display()
+    );
+    match ddamr_index::Indexer::new().scan_dir(&safe, &db_path) {
+        Ok(stats) => {
+            println!(
+                "index: scanned={} indexed={} errors={}",
+                stats.scanned, stats.indexed, stats.errors
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("index: {e}");
             1
         }
     }

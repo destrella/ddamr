@@ -2,5 +2,12 @@
 name = "ddamr-metadata"
 version = "0.1.0"
 edition = "2024"
-# Sin dependencias en fase 0 (stub). ddamr-core se añade en fase 1
-# cuando haya tipos de metadatos que definir.
+
+[dependencies]
+ddamr-core = { workspace = true }
+imagesize = "0.13"
+kamadak-exif = "0.5"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+image = { version = "0.25", features = ["jpeg", "png"] }

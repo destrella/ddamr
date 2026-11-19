@@ -22,15 +22,25 @@ crates/ddamr-app/       Solo iced (fase 1). Depende de todos los anteriores.
 crates/ddamr-cli/       CLI con el mismo core: scan, doctor.
 ```
 
-## Uso (fase 0)
+## Uso (fase 1)
 
 ```bash
-cargo test -p ddamr-core
 cargo test --workspace
 cargo run -p ddamr-cli -- scan ~/Pictures
+cargo run -p ddamr-cli -- index ~/Pictures   # DB en ~/.cache/ddamr/ddamr.db
 cargo run -p ddamr-cli -- doctor
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 ```
+
+La GUI (`cargo run -p ddamr-app`) necesita display: en una VM sin
+ventana no abre, es esperado. Su lógica se verifica con
+`cargo test -p ddamr-app` y `cargo check -p ddamr-app`.
+
+Fase 1 incluye: árbol lazy, lista paginada (200 filas), filtros y
+ordenación, indexador cancelable, lectura EXIF nativa, miniaturas
+JPEG con `ddamr-media::thumbnail` y caché LRU en `ddamr-app`.
+Pendiente para la siguiente iteración: widget virtualizado por
+scroll, miniaturas dibujadas en la UI y reproductor de audio/vídeo.
 
 Ver `../your_files/DDAMR-Analisis-y-Arquitectura.md` para el diseño completo.

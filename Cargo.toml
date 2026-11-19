@@ -17,8 +17,10 @@ resolver = "2"
 ddamr-core = { path = "crates/ddamr-core" }
 ddamr-db = { path = "crates/ddamr-db" }
 ddamr-fs = { path = "crates/ddamr-fs" }
-# metadata/media/index se añaden aquí en fase 1, cuando otro
-# crate dependa de ellos (si no, cargo avisa de dependencia sin usar).
+ddamr-metadata = { path = "crates/ddamr-metadata" }
+ddamr-index = { path = "crates/ddamr-index" }
+# ddamr-media vuelve a la tabla en fase 2, cuando ddamr-app
+# genere miniaturas con él; ningún crate depende aún de él.
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
