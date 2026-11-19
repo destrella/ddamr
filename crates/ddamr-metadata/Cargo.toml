@@ -1,0 +1,6 @@
+[package]
+name = "ddamr-metadata"
+version = "0.1.0"
+edition = "2024"
+# Sin dependencias en fase 0 (stub). ddamr-core se añade en fase 1
+# cuando haya tipos de metadatos que definir.

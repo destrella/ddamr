@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/ddamr-core",
+    "crates/ddamr-db",
+    "crates/ddamr-fs",
+    "crates/ddamr-metadata",
+    "crates/ddamr-media",
+    "crates/ddamr-index",
+    "crates/ddamr-app",
+    "crates/ddamr-cli",
+]
+resolver = "2"
+
+# Dependencias compartidas: una sola versión en todo el workspace.
+# (serde_json y tracing se añaden aquí cuando un crate los use de verdad.)
+[workspace.dependencies]
+ddamr-core = { path = "crates/ddamr-core" }
+ddamr-db = { path = "crates/ddamr-db" }
+ddamr-fs = { path = "crates/ddamr-fs" }
+# metadata/media/index se añaden aquí en fase 1, cuando otro
+# crate dependa de ellos (si no, cargo avisa de dependencia sin usar).
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"

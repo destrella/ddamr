@@ -1,0 +1,14 @@
+[package]
+name = "ddamr-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ddamr"
+path = "src/main.rs"
+
+[dependencies]
+ddamr-core = { workspace = true }
+ddamr-db = { workspace = true }
+ddamr-fs = { workspace = true }
+# ddamr-media se añade cuando el CLI haga hash (fase 1).

@@ -1,0 +1,11 @@
+[package]
+name = "ddamr-media"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ddamr-core = { workspace = true }
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
