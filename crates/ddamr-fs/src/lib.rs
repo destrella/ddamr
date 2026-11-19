@@ -284,12 +284,24 @@ fn sort_entries(entries: &mut [FileEntry], sort: SortKey, order: SortOrder) {
 }
 
 /// Busca un nodo por ruta en un bosque, en profundidad.
+///
+/// Los nodos guardan rutas canónicas (`SafePath`), pero quien busca
+/// puede pasar una ruta sin canonicalizar: en macOS `/var` es un
+/// symlink a `/private/var`, así que `TempDir` da `/var/folders/...`
+/// mientras el nodo guarda `/private/var/folders/...` y la
+/// comparación directa falla. Por eso se canonicaliza la ruta
+/// buscada antes de comparar; si no existe, se compara tal cual.
 pub fn find_node_mut<'a>(nodes: &'a mut [DirNode], path: &Path) -> Option<&'a mut DirNode> {
+    let search = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    find_node_mut_inner(nodes, &search)
+}
+
+fn find_node_mut_inner<'a>(nodes: &'a mut [DirNode], search: &Path) -> Option<&'a mut DirNode> {
     for node in nodes {
-        if node.path.path() == path {
+        if node.path.path() == search {
             return Some(node);
         }
-        if let Some(found) = find_node_mut(&mut node.children, path) {
+        if let Some(found) = find_node_mut_inner(&mut node.children, search) {
             return Some(found);
         }
     }
@@ -354,6 +366,22 @@ mod tests {
         let b = find_node_mut(&mut node.children, &root.path().join("a/b")).unwrap();
         assert_eq!(b.state, DirState::Closed);
         assert!(b.children.is_empty());
+    }
+
+    /// Regresión del fallo visto en macOS: el nodo guarda la ruta
+    /// canónica (`/private/var/...`) pero la búsqueda llegaba con
+    /// la ruta sin canonicalizar (`/var/...`). Buscar con
+    /// componentes redundantes (`a/./../a`) debe encontrar el nodo.
+    #[test]
+    fn find_node_accepts_noncanonical_search_path() {
+        let root = fixture_tree();
+        let safe = SafePath::from_root(root.path()).unwrap();
+        let mut node = DirNode::new(safe);
+        node.load_children().unwrap();
+        let odd = root.path().join("a/./../a");
+        let found = find_node_mut(&mut node.children, &odd);
+        assert!(found.is_some(), "buscar {odd:?} debe encontrar el nodo 'a'");
+        assert_eq!(found.unwrap().name(), "a");
     }
 
     #[test]
