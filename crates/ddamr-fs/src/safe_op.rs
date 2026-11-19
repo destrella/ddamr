@@ -352,7 +352,12 @@ impl SafeOp {
         };
         for entry in rd.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                out.push(entry.path());
+                // Devolver rutas canónicas: `root` ya es canónica, pero
+                // si el llamador la construyó por otro camino (p. ej.
+                // `/var` en macOS, symlink a `/private/var`), las
+                // rutas no canónicas no compararían iguales.
+                let p = entry.path();
+                out.push(p.canonicalize().unwrap_or(p));
             }
         }
         out.sort();
@@ -474,7 +479,10 @@ mod tests {
         let (dir, root, op) = setup();
         let src = write(&dir, "foto.jpg", b"recuperable");
         // Simular un respaldo a mano con el formato de SafeOp.
-        let backup_dir = dir.path().join(".ddamr-backup/manual-1");
+        // Desde `root.path()` (canónica), no desde `dir.path()`:
+        // en macOS `TempDir` es `/var/...` pero la raíz canónica
+        // es `/private/var/...` y las rutas no compararían iguales.
+        let backup_dir = root.path().join(".ddamr-backup/manual-1");
         std::fs::create_dir_all(&backup_dir).unwrap();
         std::fs::copy(src.path(), backup_dir.join("foto.jpg")).unwrap();
         std::fs::write(
