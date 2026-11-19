@@ -29,6 +29,15 @@ impl SafePath {
     /// - Un symlink dentro de `root` que apunte fuera se rechaza,
     ///   porque `canonicalize` lo resuelve antes de comparar.
     pub fn new(root: &Path, candidate: &Path) -> Result<Self> {
+        Self::new_inner(root, candidate, 0)
+    }
+
+    fn new_inner(root: &Path, candidate: &Path, depth: u8) -> Result<Self> {
+        if depth > 16 {
+            return Err(AppError::InvalidPath(
+                "demasiados symlinks encadenados".into(),
+            ));
+        }
         let root_canon = root.canonicalize().map_err(|e| AppError::Io {
             path: root.to_path_buf(),
             source: e,
@@ -39,6 +48,34 @@ impl SafePath {
         } else {
             root_canon.join(candidate)
         };
+        // Normalizar `..` y `.` léxicamente ANTES de tocar el disco.
+        // Sin esto, el resultado depende de la profundidad del
+        // directorio temporal: en Linux `/tmp/.tmpXXX/../../etc/passwd`
+        // existe y se resolvía a `/etc/passwd`, pero en macOS el
+        // temporal es `/var/folders/.../T/.tmpXXX` y esa misma ruta
+        // cae en un `etc/` inexistente, con lo que el código anterior
+        // devolvía un error de E/S en vez de `OutsideRoot`.
+        let abs = normalize_lexically(&abs);
+
+        // Un symlink roto no "existe" para `Path::exists`, así que
+        // hay que resolverlo explícitamente; si no, un enlace roto
+        // que apunte fuera de la raíz se aceptaría como ruta interior.
+        if let Ok(md) = std::fs::symlink_metadata(&abs)
+            && md.file_type().is_symlink()
+        {
+            let target = std::fs::read_link(&abs).map_err(|e| AppError::Io {
+                path: abs.clone(),
+                source: e,
+            })?;
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                abs.parent()
+                    .map(|p| p.join(target))
+                    .ok_or_else(|| AppError::InvalidPath(format!("sin padre: {}", abs.display())))?
+            };
+            return Self::new_inner(root, &resolved, depth + 1);
+        }
 
         let canon = if abs.exists() {
             abs.canonicalize().map_err(|e| AppError::Io {
@@ -46,18 +83,29 @@ impl SafePath {
                 source: e,
             })?
         } else {
-            let parent = abs
-                .parent()
-                .ok_or_else(|| AppError::InvalidPath(format!("sin padre: {}", abs.display())))?;
-            let file_name = abs
-                .file_name()
-                .ok_or_else(|| AppError::InvalidPath(format!("sin nombre: {}", abs.display())))?;
-            // El padre debe existir; si no, no se puede validar la ruta.
-            let parent_canon = parent.canonicalize().map_err(|e| AppError::Io {
-                path: parent.to_path_buf(),
+            // La ruta no existe: buscar el ancestro existente más
+            // largo, canonicalizarlo (resuelve symlinks reales) y
+            // unir el resto, que ya no contiene `..` ni `.`.
+            // Así funcionan tanto `nuevo.txt` como `a/b/c.txt`
+            // con directorios intermedios aún no creados, y un
+            // escape a una ruta inexistente sigue siendo
+            // `OutsideRoot` en vez de un error de E/S.
+            let mut ancestor: Option<PathBuf> = None;
+            for anc in abs.ancestors() {
+                if anc.exists() {
+                    ancestor = Some(anc.to_path_buf());
+                    break;
+                }
+            }
+            let anc = ancestor.ok_or_else(|| {
+                AppError::InvalidPath(format!("sin ancestro existente: {}", abs.display()))
+            })?;
+            let anc_canon = anc.canonicalize().map_err(|e| AppError::Io {
+                path: anc.clone(),
                 source: e,
             })?;
-            parent_canon.join(file_name)
+            let remainder = abs.strip_prefix(&anc).unwrap_or(Path::new(""));
+            anc_canon.join(remainder)
         };
 
         if !canon.starts_with(&root_canon) {
@@ -100,6 +148,24 @@ impl SafePath {
     pub fn relative(&self) -> &Path {
         self.inner.strip_prefix(&self.root).unwrap_or(Path::new(""))
     }
+}
+
+/// Resuelve `.` y `..` sin tocar el disco. En una ruta absoluta,
+/// un `..` en la raíz se descarta. No resuelve symlinks: eso lo hace
+/// `canonicalize` sobre el ancestro existente en `SafePath::new`.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
 }
 
 impl AsRef<Path> for SafePath {
@@ -169,6 +235,44 @@ mod tests {
         assert_eq!(ok.relative(), Path::new("nuevo.txt"));
 
         let err = SafePath::new(root.path(), &outside.path().join("nuevo.txt")).unwrap_err();
+        assert!(matches!(err, AppError::OutsideRoot(_)));
+    }
+
+    /// Regresión del fallo visto en macOS: el temporal es profundo
+    /// (`/var/folders/.../T/.tmpXXX`), así que `../../etc/passwd`
+    /// no existe y el código anterior devolvía E/S en vez de
+    /// `OutsideRoot`. Con suficientes `..` para salir de la raíz,
+    /// el escape debe rechazarse aunque el destino no exista.
+    #[test]
+    fn deep_dotdot_escape_to_nonexistent_is_rejected() {
+        let (root, _) = setup();
+        let deep = root.path().join("a/b/c/d");
+        std::fs::create_dir_all(&deep).unwrap();
+        let base = SafePath::new(root.path(), &deep).unwrap();
+        let err = base
+            .join(Path::new("../../../../../../etc/passwd"))
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::OutsideRoot(_)),
+            "escape profundo a ruta inexistente debe ser OutsideRoot, fue: {err:?}"
+        );
+    }
+
+    /// Una ruta inexistente con intermedios aún no creados dentro
+    /// de la raíz debe aceptarse (destino de un mover/archivado).
+    #[test]
+    fn nonexistent_nested_inside_is_allowed() {
+        let (root, _) = setup();
+        let ok = SafePath::new(root.path(), &root.path().join("nuevo/sub/archivo.txt")).unwrap();
+        assert_eq!(ok.relative(), Path::new("nuevo/sub/archivo.txt"));
+    }
+
+    #[test]
+    fn broken_symlink_pointing_outside_is_rejected() {
+        let (root, outside) = setup();
+        let target = outside.path().join("no-existe.txt");
+        symlink(&target, root.path().join("roto.txt")).unwrap();
+        let err = SafePath::new(root.path(), &root.path().join("roto.txt")).unwrap_err();
         assert!(matches!(err, AppError::OutsideRoot(_)));
     }
 }
