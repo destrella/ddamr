@@ -96,8 +96,11 @@ impl SafeOp {
     }
 
     /// Copia `src` al respaldo y escribe el manifiesto con el
-    /// origen. Devuelve el directorio del respaldo.
-    fn backup(&self, src: &SafePath) -> Result<PathBuf> {
+    /// origen. Devuelve el directorio del respaldo. Es público
+    /// para que la orquestación de edición de metadatos
+    /// (`ddamr-app/src/metadata_edit.rs`) pueda respaldar antes
+    /// de trabajar sobre una copia, sin duplicar esta lógica.
+    pub fn backup_file(&self, src: &SafePath) -> Result<PathBuf> {
         let dir = self.backup_root().join(op_id());
         std::fs::create_dir_all(&dir).map_err(|e| AppError::Io {
             path: dir.clone(),
@@ -154,13 +157,43 @@ impl SafeOp {
         let _ = std::fs::remove_dir_all(backup_dir);
     }
 
-    fn discard_backup(&self, backup_dir: &Path) {
+    /// Borra el directorio de respaldo (solo tras el éxito).
+    /// Público para la orquestación de edición de metadatos.
+    pub fn discard_backup(&self, backup_dir: &Path) {
         if let Err(e) = std::fs::remove_dir_all(backup_dir) {
             eprintln!(
                 "SafeOp: no se pudo borrar el respaldo {}: {e}",
                 backup_dir.display()
             );
         }
+    }
+
+    /// Restaura `src` desde su respaldo: copia el archivo
+    /// respaldado encima del original (sobrescribe) y borra el
+    /// respaldo. Se usa cuando una edición ya reemplazó el
+    /// original pero la verificación posterior falló. A diferencia
+    /// de `restore_and_discard`, restaura aunque el original
+    /// siga existiendo, y verifica el hash restaurado.
+    pub fn restore_backup_file(&self, backup_dir: &Path, src: &SafePath) -> Result<()> {
+        let name = src
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archivo".into());
+        let backup_file = backup_dir.join(&name);
+        let backup_hash = hash_file(&backup_file)?;
+        std::fs::copy(&backup_file, src.path()).map_err(|e| AppError::Io {
+            path: src.path().to_path_buf(),
+            source: e,
+        })?;
+        if hash_file(src.path())? != backup_hash {
+            return Err(AppError::Other(format!(
+                "la restauración de {} no coincide con el respaldo",
+                src.path().display()
+            )));
+        }
+        self.discard_backup(backup_dir);
+        Ok(())
     }
 
     /// Mueve `src` a `dst` con el patrón completo. Devuelve el
@@ -172,7 +205,7 @@ impl SafeOp {
             ));
         }
         let original_hash = hash_file(src.path())?;
-        let backup_dir = self.backup(src)?;
+        let backup_dir = self.backup_file(src)?;
         let result = self.move_file_inner(src, dst, &original_hash);
         match result {
             Ok(final_dst) => {

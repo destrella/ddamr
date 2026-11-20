@@ -5,6 +5,7 @@
 //! todo lo pesado va en `Task::perform`.
 
 pub mod app;
+pub mod metadata_edit;
 pub mod virtual_list;
 
 pub use app::{App, Message, ViewMode};

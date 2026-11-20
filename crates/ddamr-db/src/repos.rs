@@ -13,7 +13,10 @@ fn db_err(e: rusqlite::Error) -> AppError {
     AppError::Database(e.to_string())
 }
 
-fn file_id(conn: &Connection, rel_path: &str) -> Result<i64> {
+/// Id de la fila `files` de una ruta relativa. Público para la
+/// UI (regiones) y para los tests; el error distingue "no
+/// indexado" de un fallo de DB.
+pub fn file_id_for_path(conn: &Connection, rel_path: &str) -> Result<i64> {
     conn.query_row(
         "SELECT id FROM files WHERE path = ?1",
         params![rel_path],
@@ -25,6 +28,10 @@ fn file_id(conn: &Connection, rel_path: &str) -> Result<i64> {
         }
         other => db_err(other),
     })
+}
+
+fn file_id(conn: &Connection, rel_path: &str) -> Result<i64> {
+    file_id_for_path(conn, rel_path)
 }
 
 /// Redondea a 4 decimales (~11 m): la precisión para dedup de
@@ -78,6 +85,29 @@ impl TagRepo {
         let mut stmt = conn.prepare(&sql).map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
+                Ok(Tag {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    usage_count: r.get(2)?,
+                })
+            })
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)
+    }
+
+    /// Etiquetas asociadas a un archivo, por nombre.
+    pub fn list_for_file(conn: &Connection, rel_path: &str) -> Result<Vec<Tag>> {
+        let fid = file_id(conn, rel_path)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT tags.id, tags.name, tags.usage_count FROM tags
+                 JOIN file_tags ON file_tags.tag_id = tags.id
+                 WHERE file_tags.file_id = ?1 ORDER BY tags.name ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![fid], |r| {
                 Ok(Tag {
                     id: r.get(0)?,
                     name: r.get(1)?,
@@ -274,6 +304,64 @@ impl LocationRepo {
         .map_err(db_err)?;
         Ok(())
     }
+
+    /// Ubicación asignada a un archivo, si la tiene.
+    pub fn file_location(conn: &Connection, rel_path: &str) -> Result<Option<Location>> {
+        let fid = file_id(conn, rel_path)?;
+        match conn.query_row(
+            "SELECT locations.id, locations.name, locations.lat, locations.lon,
+                    locations.lat_r, locations.lon_r, locations.city,
+                    locations.state, locations.country, locations.usage_count
+             FROM locations
+             JOIN file_locations ON file_locations.location_id = locations.id
+             WHERE file_locations.file_id = ?1",
+            params![fid],
+            |r| {
+                Ok(Location {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    lat: r.get(2)?,
+                    lon: r.get(3)?,
+                    lat_r: r.get(4)?,
+                    lon_r: r.get(5)?,
+                    city: r.get(6)?,
+                    state: r.get(7)?,
+                    country: r.get(8)?,
+                    usage_count: r.get(9)?,
+                })
+            },
+        ) {
+            Ok(loc) => Ok(Some(loc)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Quita la ubicación de un archivo y baja el contador de uso
+    /// de la ubicación anterior. No borra la ubicación en sí.
+    pub fn remove_file_location(conn: &Connection, rel_path: &str) -> Result<()> {
+        let fid = file_id(conn, rel_path)?;
+        let old: Option<i64> = conn
+            .query_row(
+                "SELECT location_id FROM file_locations WHERE file_id = ?1",
+                params![fid],
+                |r| r.get(0),
+            )
+            .ok();
+        conn.execute(
+            "DELETE FROM file_locations WHERE file_id = ?1",
+            params![fid],
+        )
+        .map_err(db_err)?;
+        if let Some(id) = old {
+            conn.execute(
+                "UPDATE locations SET usage_count = MAX(0, usage_count - 1) WHERE id = ?1",
+                params![id],
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    }
 }
 
 // -------------------------------------------------------------- regions
@@ -327,6 +415,14 @@ impl RegionRepo {
             |r| r.get(0),
         )
         .map_err(db_err)
+    }
+
+    /// Borra una región por id. Devuelve `true` si existía.
+    pub fn remove(conn: &Connection, id: i64) -> Result<bool> {
+        let n = conn
+            .execute("DELETE FROM regions WHERE id = ?1", params![id])
+            .map_err(db_err)?;
+        Ok(n > 0)
     }
 
     pub fn list_for_file(conn: &Connection, file_id: i64) -> Result<Vec<Region>> {
@@ -523,6 +619,57 @@ mod tests {
         assert!(RegionRepo::add(&conn, fid, "Ana", 0.1, 0.1, 0.2, 0.3).is_ok()); // dedup
         assert_eq!(RegionRepo::list_for_file(&conn, fid).unwrap().len(), 1);
         assert!(RegionRepo::add(&conn, fid, "Fuera", 0.9, 0.1, 0.5, 0.3).is_err());
+    }
+
+    #[test]
+    fn tags_list_for_file_and_location_assign_remove() {
+        let (_dir, conn, rel) = db_with_file();
+        // Etiquetas: añadir dos, listar, quitar una.
+        let a = TagRepo::create(&conn, "Playa").unwrap();
+        let b = TagRepo::create(&conn, "Sol").unwrap();
+        TagRepo::add_to_file(&conn, &rel, a).unwrap();
+        TagRepo::add_to_file(&conn, &rel, b).unwrap();
+        let tags = TagRepo::list_for_file(&conn, &rel).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "Playa");
+        TagRepo::remove_from_file(&conn, &rel, a).unwrap();
+        assert_eq!(TagRepo::list_for_file(&conn, &rel).unwrap().len(), 1);
+        // Ubicación: sin asignar, asignar, quitar.
+        assert!(LocationRepo::file_location(&conn, &rel).unwrap().is_none());
+        let loc = LocationRepo::create(
+            &conn,
+            "Playa A",
+            41.387_4,
+            2.168_9,
+            Some("Barcelona"),
+            None,
+            Some("España"),
+        )
+        .unwrap();
+        LocationRepo::set_file_location(&conn, &rel, loc).unwrap();
+        let got = LocationRepo::file_location(&conn, &rel).unwrap().unwrap();
+        assert_eq!(got.name, "Playa A");
+        assert_eq!(got.city.as_deref(), Some("Barcelona"));
+        assert_eq!(got.usage_count, 1);
+        LocationRepo::remove_file_location(&conn, &rel).unwrap();
+        assert!(LocationRepo::file_location(&conn, &rel).unwrap().is_none());
+        let after = LocationRepo::list_sorted(&conn, LocationSort::Alpha).unwrap();
+        assert_eq!(after[0].usage_count, 0);
+    }
+
+    #[test]
+    fn regions_add_list_and_remove() {
+        let (_dir, conn, _rel) = db_with_file();
+        let fid: i64 = conn
+            .query_row("SELECT id FROM files WHERE path='foto.jpg'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let id = RegionRepo::add(&conn, fid, "Ana", 0.1, 0.1, 0.2, 0.3).unwrap();
+        assert_eq!(RegionRepo::list_for_file(&conn, fid).unwrap().len(), 1);
+        assert!(RegionRepo::remove(&conn, id).unwrap());
+        assert!(RegionRepo::list_for_file(&conn, fid).unwrap().is_empty());
+        assert!(!RegionRepo::remove(&conn, id).unwrap(), "dos veces no");
     }
 
     #[test]

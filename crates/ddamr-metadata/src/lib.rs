@@ -224,7 +224,7 @@ pub fn exiftool_raw(path: &SafePath) -> Result<String> {
 
 /// Metadatos básicos de un archivo multimedia. Todos los campos
 /// son opcionales: un archivo sin EXIF da `None`/`false`, no un error.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BasicMetadata {
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -233,6 +233,11 @@ pub struct BasicMetadata {
     pub has_keywords: bool,
     pub has_location: bool,
     pub has_description: bool,
+    /// Texto de `ImageDescription`/`UserComment`, si lo hay. Es lo
+    /// que pre-rellena el formulario de edición (fase 2b).
+    pub description: Option<String>,
+    /// (latitud, longitud) en grados decimales, si el EXIF trae GPS.
+    pub gps: Option<(f64, f64)>,
 }
 
 /// Lee los metadatos básicos de un archivo. Infallible por diseño.
@@ -268,6 +273,13 @@ pub fn read_basic(path: &SafePath) -> BasicMetadata {
         Ok(e) => e,
         Err(_) => return meta,
     };
+    // GPS se reconstruye al final: latitud/longitud llegan como
+    // tres racionales (grados, minutos, segundos) y su referencia
+    // (N/S, E/W) en campos separados.
+    let mut lat_dms: Option<(f64, f64, f64)> = None;
+    let mut lat_ref: Option<String> = None;
+    let mut lon_dms: Option<(f64, f64, f64)> = None;
+    let mut lon_ref: Option<String> = None;
     for field in exif.fields() {
         match field.tag {
             exif::Tag::DateTimeOriginal => {
@@ -277,12 +289,24 @@ pub fn read_basic(path: &SafePath) -> BasicMetadata {
                     meta.created_at = parse_exif_datetime(&s);
                 }
             }
-            exif::Tag::GPSLatitude | exif::Tag::GPSLongitude => {
+            exif::Tag::GPSLatitude => {
                 meta.has_location = true;
+                lat_dms = rational_triplet(field);
             }
+            exif::Tag::GPSLongitude => {
+                meta.has_location = true;
+                lon_dms = rational_triplet(field);
+            }
+            exif::Tag::GPSLatitudeRef => lat_ref = ascii_value(field),
+            exif::Tag::GPSLongitudeRef => lon_ref = ascii_value(field),
             exif::Tag::ImageDescription | exif::Tag::UserComment => {
-                if ascii_value(field).is_some_and(|s| !s.trim().is_empty()) {
+                if let Some(s) = ascii_value(field).map(clean_description)
+                    && !s.is_empty()
+                {
                     meta.has_description = true;
+                    if meta.description.is_none() {
+                        meta.description = Some(s);
+                    }
                 }
             }
             _ => {
@@ -296,7 +320,52 @@ pub fn read_basic(path: &SafePath) -> BasicMetadata {
             }
         }
     }
+    if let (Some(lat), Some(lon)) = (
+        dms_to_decimal(lat_dms, lat_ref.as_deref()),
+        dms_to_decimal(lon_dms, lon_ref.as_deref()),
+    ) {
+        meta.gps = Some((lat, lon));
+    }
     meta
+}
+
+/// Tres racionales (grados, minutos, segundos) de un campo GPS.
+fn rational_triplet(field: &exif::Field) -> Option<(f64, f64, f64)> {
+    if let exif::Value::Rational(v) = &field.value
+        && v.len() == 3
+    {
+        let f = |r: &exif::Rational| {
+            if r.denom == 0 {
+                0.0
+            } else {
+                r.num as f64 / r.denom as f64
+            }
+        };
+        Some((f(&v[0]), f(&v[1]), f(&v[2])))
+    } else {
+        None
+    }
+}
+
+/// (grados, minutos, segundos) + referencia → decimal con signo.
+fn dms_to_decimal(dms: Option<(f64, f64, f64)>, reference: Option<&str>) -> Option<f64> {
+    let (d, m, s) = dms?;
+    let mut v = d + m / 60.0 + s / 3600.0;
+    if matches!(reference, Some("S") | Some("W")) {
+        v = -v;
+    }
+    Some(v)
+}
+
+/// Limpia un texto de descripción EXIF: recorta espacios y nulos,
+/// y quita el prefijo de codificación de `UserComment`
+/// ("ASCII\0\0\0" y similares).
+fn clean_description(s: String) -> String {
+    let mut s = s.trim().trim_matches('\0').trim().to_string();
+    if let Some(rest) = s.strip_prefix("ASCII") {
+        s = rest.trim_matches('\0').trim().to_string();
+    }
+    s
 }
 
 /// Primer valor ASCII de un campo EXIF, si lo tiene.

@@ -1,12 +1,19 @@
-//! Buscador de duplicados (fase 2).
+//! Buscador de duplicados (fases 2 y 2b).
 //!
 //! Estrategia, en orden de coste:
 //! 1. Agrupar por `size_bytes` en SQL: solo los tamaños con más
-//!    de un archivo pueden ser duplicados.
+//!    de un archivo pueden ser duplicados exactos.
 //! 2. Dentro de cada grupo, exactos por `hash_blake3` (BLAKE3 en
 //!    streaming; nunca se carga un archivo entero).
-//! 3. Los que no son exactos: imágenes por dHash (Hamming ≤ 10),
-//!    vídeos por dHash de frames (media de Hamming ≤ 10).
+//! 3. Imágenes por dHash (Hamming ≤ 10) entre TODAS las imágenes
+//!    indexadas, sin importar el tamaño de archivo (fase 2b: dos
+//!    recompresiones JPEG de la misma foto tienen distinto tamaño
+//!    y el agrupado previo por tamaño nunca las comparaba). Con
+//!    más de 2000 imágenes con dHash, la comparación se hace
+//!    solo dentro de grupos por los 16 bits altos del dHash para
+//!    no hacer O(n²) sobre decenas de miles.
+//! 4. Vídeos por dHash de frames (media de Hamming ≤ 10), dentro
+//!    de cada grupo de tamaño.
 //!
 //! `find_duplicates` usa solo lo ya guardado en la DB;
 //! `find_duplicates_with_root` calcula y guarda los hashes que
@@ -65,44 +72,59 @@ impl DuplicateGroup {
     }
 }
 
-/// Candidatos: archivos cuyo tamaño aparece más de una vez.
-fn load_candidates(conn: &Connection) -> Result<Vec<FileInfo>> {
+/// Una fila de `files` → `FileInfo`. La misma consulta sirve
+/// para candidatos por tamaño y para todas las imágenes.
+fn row_to_file_info(r: &rusqlite::Row) -> rusqlite::Result<FileInfo> {
+    let dhash_video: Option<String> = r.get(6)?;
+    Ok(FileInfo {
+        path: r.get(0)?,
+        name: r.get(1)?,
+        size_bytes: r.get::<_, i64>(2)? as u64,
+        kind: MediaKind::from_db_str(&r.get::<_, String>(3)?),
+        hash_blake3: r.get(4)?,
+        dhash_image: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+        dhash_video: dhash_video.map(|s| {
+            s.split(',')
+                .filter_map(|p| p.trim().parse::<u64>().ok())
+                .collect()
+        }),
+        width: r.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+        height: r.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+        duration_ms: r.get(9)?,
+        created_at: r.get(10)?,
+        modified_at: r.get(11)?,
+    })
+}
+
+const FILE_COLUMNS: &str = "path, name, size_bytes, kind, hash_blake3, dhash_image,
+    dhash_video, width, height, duration_ms, created_at, modified_at";
+
+fn load_files(conn: &Connection, where_sql: &str) -> Result<Vec<FileInfo>> {
+    let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE {where_sql} ORDER BY path");
     let mut stmt = conn
-        .prepare(
-            "SELECT path, name, size_bytes, kind, hash_blake3, dhash_image,
-                    dhash_video, width, height, duration_ms, created_at, modified_at
-             FROM files
-             WHERE size_bytes IN (
-                 SELECT size_bytes FROM files GROUP BY size_bytes HAVING COUNT(*) > 1
-             )
-             ORDER BY size_bytes, path",
-        )
+        .prepare(&sql)
         .map_err(|e| AppError::Database(e.to_string()))?;
     let rows = stmt
-        .query_map([], |r| {
-            let dhash_video: Option<String> = r.get(6)?;
-            Ok(FileInfo {
-                path: r.get(0)?,
-                name: r.get(1)?,
-                size_bytes: r.get::<_, i64>(2)? as u64,
-                kind: MediaKind::from_db_str(&r.get::<_, String>(3)?),
-                hash_blake3: r.get(4)?,
-                dhash_image: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                dhash_video: dhash_video.map(|s| {
-                    s.split(',')
-                        .filter_map(|p| p.trim().parse::<u64>().ok())
-                        .collect()
-                }),
-                width: r.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-                height: r.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-                duration_ms: r.get(9)?,
-                created_at: r.get(10)?,
-                modified_at: r.get(11)?,
-            })
-        })
+        .query_map([], row_to_file_info)
         .map_err(|e| AppError::Database(e.to_string()))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Candidatos: archivos cuyo tamaño aparece más de una vez.
+fn load_candidates(conn: &Connection) -> Result<Vec<FileInfo>> {
+    load_files(
+        conn,
+        "size_bytes IN (
+            SELECT size_bytes FROM files GROUP BY size_bytes HAVING COUNT(*) > 1
+        )",
+    )
+}
+
+/// Todas las imágenes indexadas, para la comparación por dHash
+/// entre tamaños distintos (fase 2b).
+fn load_all_images(conn: &Connection) -> Result<Vec<FileInfo>> {
+    load_files(conn, "kind = 'image'")
 }
 
 /// Calcula (y guarda) el BLAKE3 de los archivos del grupo que no
@@ -225,13 +247,51 @@ fn video_frames_similar(a: &[u64], b: &[u64]) -> bool {
     sum as f64 / a.len() as f64 <= DHASH_THRESHOLD as f64
 }
 
+/// Límite de imágenes con dHash para la comparación global
+/// O(n²): por encima, se compara solo dentro de grupos por los
+/// 16 bits altos del dHash.
+const DHASH_GLOBAL_LIMIT: usize = 2000;
+
+/// Agrupa imágenes por similitud visual (Hamming ≤ umbral),
+/// sin importar el tamaño de archivo. Con pocas imágenes se
+/// compara todo contra todo; con muchas, solo dentro de cada
+/// grupo de 16 bits altos del dHash.
+fn cluster_images(images: Vec<FileInfo>) -> Vec<Vec<FileInfo>> {
+    let with_dhash: Vec<FileInfo> = images
+        .into_iter()
+        .filter(|f| f.dhash_image.is_some())
+        .collect();
+    let similar = |a: &FileInfo, b: &FileInfo| {
+        hamming(a.dhash_image.unwrap(), b.dhash_image.unwrap()) <= DHASH_THRESHOLD
+    };
+    if with_dhash.len() <= DHASH_GLOBAL_LIMIT {
+        return cluster_by(with_dhash, similar);
+    }
+    // Buckets por los 16 bits altos del dHash: dos imágenes
+    // similares casi siempre comparten esos bits.
+    let mut buckets: Vec<(u64, Vec<FileInfo>)> = Vec::new();
+    for f in with_dhash {
+        let key = f.dhash_image.unwrap() >> 48;
+        match buckets.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(f),
+            None => buckets.push((key, vec![f])),
+        }
+    }
+    let mut out = Vec::new();
+    for (_, bucket) in buckets {
+        out.extend(cluster_by(bucket, similar));
+    }
+    out
+}
+
 fn find_duplicates_inner(
     conn: &Connection,
     root: Option<&SafePath>,
 ) -> Result<Vec<DuplicateGroup>> {
     let candidates = load_candidates(conn)?;
     let mut groups: Vec<DuplicateGroup> = Vec::new();
-    // Agrupar por tamaño: los de distinto tamaño no se comparan.
+    // Agrupar por tamaño: los de distinto tamaño no pueden ser
+    // duplicados exactos (pero sí similares por dHash: ver abajo).
     let mut by_size: Vec<(u64, Vec<FileInfo>)> = Vec::new();
     for f in candidates {
         match by_size.iter_mut().find(|(s, _)| *s == f.size_bytes) {
@@ -257,25 +317,18 @@ fn find_duplicates_inner(
             if g.len() > 1 {
                 groups.push(DuplicateGroup::new(DuplicateKind::Exact, g));
             } else {
-                // Hash único: pasa a la comparación visual.
+                // Hash único: pasa a la comparación visual de vídeo
+                // (las imágenes se comparan en el paso global).
                 rest.push(g.into_iter().next().unwrap());
             }
         }
-        // 2) Imágenes visualmente similares por dHash.
-        let (images, videos): (Vec<FileInfo>, Vec<FileInfo>) =
-            rest.into_iter().partition(|f| f.kind == MediaKind::Image);
-        let mut images = images;
-        fill_missing_image_dhash(conn, root, &mut images);
-        let with_dhash: Vec<FileInfo> = images
+        // 2) Vídeos visualmente similares por dHash de frames.
+        // Las imágenes ya no se comparan aquí: el paso global de
+        // abajo las compara entre todos los tamaños.
+        let videos: Vec<FileInfo> = rest
             .into_iter()
-            .filter(|f| f.dhash_image.is_some())
+            .filter(|f| f.kind == MediaKind::Video)
             .collect();
-        for g in cluster_by(with_dhash, |a, b| {
-            hamming(a.dhash_image.unwrap(), b.dhash_image.unwrap()) <= DHASH_THRESHOLD
-        }) {
-            groups.push(DuplicateGroup::new(DuplicateKind::ImageDHash, g));
-        }
-        // 3) Vídeos visualmente similares por dHash de frames.
         let mut videos = videos;
         fill_missing_video_dhash(conn, root, &mut videos);
         let with_vdhash: Vec<FileInfo> = videos
@@ -290,6 +343,20 @@ fn find_duplicates_inner(
         }) {
             groups.push(DuplicateGroup::new(DuplicateKind::VideoDHash, g));
         }
+    }
+    // 3) Imágenes similares por dHash entre TODOS los tamaños.
+    // Un par exacto no se repite aquí: sus archivos ya están en
+    // un grupo Exact y se excluyen de esta pasada.
+    let exact_paths: std::collections::HashSet<&str> = groups
+        .iter()
+        .filter(|g| g.kind == DuplicateKind::Exact)
+        .flat_map(|g| g.files.iter().map(|f| f.path.as_str()))
+        .collect();
+    let mut images = load_all_images(conn)?;
+    images.retain(|f| !exact_paths.contains(f.path.as_str()));
+    fill_missing_image_dhash(conn, root, &mut images);
+    for g in cluster_images(images) {
+        groups.push(DuplicateGroup::new(DuplicateKind::ImageDHash, g));
     }
     groups.sort_by_key(|a| std::cmp::Reverse(a.total_bytes));
     Ok(groups)
@@ -380,9 +447,7 @@ mod tests {
             };
         }
         b.put_pixel(63, 63, Rgb([250, 250, 250]));
-        // BMP sin comprimir: mismo tamaño de archivo garantizado
-        // (un PNG cambiaría de tamaño por un solo píxel y el
-        // algoritmo agrupa primero por tamaño).
+        // BMP sin comprimir: mismo tamaño de archivo garantizado.
         a.save(root.path().join("a.bmp")).unwrap();
         b.save(root.path().join("b.bmp")).unwrap();
         // Tercera imagen distinta (invertida) con el mismo tamaño
@@ -405,5 +470,52 @@ mod tests {
     fn no_duplicates_when_all_different_sizes() {
         let (_root, _dbdir, conn) = setup(&[("a.jpg", b"1"), ("b.jpg", b"12"), ("c.jpg", b"123")]);
         assert!(find_duplicates(&conn).unwrap().is_empty());
+    }
+
+    /// Regresión de la fase 2b: la misma imagen guardada como
+    /// JPEG con distinta calidad tiene distinto tamaño de archivo
+    /// y la misma apariencia: ahora se detecta por dHash aunque
+    /// el agrupado previo por tamaño nunca las habría comparado.
+    #[test]
+    fn image_dhash_groups_same_image_different_file_sizes() {
+        use image::{ImageBuffer, Rgb, codecs::jpeg::JpegEncoder};
+        let root = TempDir::new().unwrap();
+        let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(64, 64);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let v = ((x * 4 + y * 2) % 256) as u8;
+            *px = Rgb([v, 255 - v, (x + y) as u8]);
+        }
+        let dyn_img = image::DynamicImage::ImageRgb8(img);
+        let mut f95 = std::fs::File::create(root.path().join("alta.jpg")).unwrap();
+        JpegEncoder::new_with_quality(&mut f95, 95)
+            .encode_image(&dyn_img)
+            .unwrap();
+        let mut f30 = std::fs::File::create(root.path().join("baja.jpg")).unwrap();
+        JpegEncoder::new_with_quality(&mut f30, 30)
+            .encode_image(&dyn_img)
+            .unwrap();
+        let size95 = std::fs::metadata(root.path().join("alta.jpg"))
+            .unwrap()
+            .len();
+        let size30 = std::fs::metadata(root.path().join("baja.jpg"))
+            .unwrap()
+            .len();
+        assert_ne!(
+            size95, size30,
+            "el test necesita tamaños distintos para ser válido"
+        );
+        let db_dir = TempDir::new().unwrap();
+        let mut conn = open(&db_dir.path().join("t.db")).unwrap();
+        let entries: Vec<FileEntry> = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| FileEntry::from_dir_entry(root.path(), &e).ok())
+            .collect();
+        insert_files_batch(&mut conn, &entries).unwrap();
+        let safe = SafePath::from_root(root.path()).unwrap();
+        let groups = find_duplicates_with_root(&conn, &safe).unwrap();
+        assert_eq!(groups.len(), 1, "misma imagen, distinto tamaño: {groups:?}");
+        assert_eq!(groups[0].kind, DuplicateKind::ImageDHash);
+        assert_eq!(groups[0].files.len(), 2);
     }
 }

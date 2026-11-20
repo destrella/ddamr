@@ -815,6 +815,7 @@ dependencies = [
  "ddamr-index",
  "ddamr-metadata",
  "iced",
+ "rusqlite",
  "tempfile",
 ]
 
