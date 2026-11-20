@@ -816,6 +816,7 @@ dependencies = [
  "ddamr-media",
  "ddamr-metadata",
  "iced",
+ "image",
  "rusqlite",
  "tempfile",
 ]

@@ -181,20 +181,6 @@ fn ym_from_ms(ms: i64) -> Option<(u32, u32)> {
     Some((year as u32, m as u32))
 }
 
-/// Directorio de caché de miniaturas: `DDAMR_THUMBS_DIR` si está
-/// definida (los tests la usan para no tocar el home real), si no
-/// `~/.cache/ddamr/thumbs`.
-fn thumbs_cache_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("DDAMR_THUMBS_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
-    }
-    std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".cache").join("ddamr").join("thumbs"))
-        .unwrap_or_default()
-}
-
 /// `ddamr thumbs <dir>`: miniaturas de 256 px de las imágenes del
 /// directorio (no recursivo) en la caché. Devuelve 0 aunque fallen
 /// imágenes sueltas; 1 solo si el directorio no existe o no se
@@ -216,7 +202,8 @@ fn thumbs(dir: &Path) -> i32 {
 /// fallaron). Si un archivo de caché ya existe no se regenera. Las
 /// fallidas se informan por stderr con su ruta y el motivo.
 fn thumbs_dir(dir: &Path) -> (usize, usize, usize) {
-    let cache = thumbs_cache_dir();
+    // La caché es la misma que usa la app (`ddamr-media`).
+    let cache = ddamr_media::thumbs_cache_dir();
     if let Err(e) = std::fs::create_dir_all(&cache) {
         eprintln!("error: no se pudo crear la caché {}: {e}", cache.display());
         return (0, 0, 0);

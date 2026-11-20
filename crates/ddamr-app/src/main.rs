@@ -4,7 +4,9 @@
 use ddamr_app::App;
 
 fn main() -> iced::Result {
-    iced::application(App::default, App::update, App::view)
+    // `App::boot` (no `App::default`): al abrir, la raíz aparece
+    // expandida y el panel ya muestra sus elementos.
+    iced::application(App::boot, App::update, App::view)
         .title(|_app: &App| "DDAMR".to_string())
         .subscription(App::subscription)
         .run()

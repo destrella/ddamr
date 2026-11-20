@@ -198,9 +198,16 @@ pub fn thumbnail_sized(path: &SafePath, max_side: u32) -> Result<Vec<u8>> {
 }
 
 /// Núcleo compartido: reduce `img` a una miniatura JPEG (calidad 80)
-/// con el lado mayor como máximo en `max_side` píxeles. Rechaza
-/// imágenes de más de 100 megapíxeles para no reservar memoria
-/// desmedida.
+/// con el lado mayor como máximo en `max_side` píxeles, conservando
+/// la proporción original. Rechaza imágenes de más de 100
+/// megapíxeles para no reservar memoria desmedida.
+///
+/// OJO: `image::imageops::thumbnail(img, n, n)` NO conserva la
+/// proporción: re-muestrea la imagen a exactamente n×n,
+/// aplastándola a cuadrado. Por eso el tamaño se calcula aquí
+/// explícitamente y se usa `resize` con esas dimensiones. Las
+/// miniaturas cuadradas que se veían en la UI venían de aquí, no
+/// solo del widget.
 fn jpeg_thumbnail(img: &image::DynamicImage, max_side: u32) -> Result<Vec<u8>> {
     use std::io::Cursor;
     if img.width() as u64 * img.height() as u64 > 100_000_000 {
@@ -210,7 +217,23 @@ fn jpeg_thumbnail(img: &image::DynamicImage, max_side: u32) -> Result<Vec<u8>> {
             img.height()
         )));
     }
-    let thumb = image::imageops::thumbnail(img, max_side, max_side);
+    let (w, h) = (img.width(), img.height());
+    let scale = max_side as f32 / w.max(h).max(1) as f32;
+    let (tw, th) = if scale >= 1.0 {
+        // No ampliar imágenes pequeñas: se quedan como están.
+        (w, h)
+    } else {
+        (
+            (w as f32 * scale).round() as u32,
+            (h as f32 * scale).round() as u32,
+        )
+    };
+    let thumb = image::imageops::resize(
+        img,
+        tw.max(1),
+        th.max(1),
+        image::imageops::FilterType::Triangle,
+    );
     let mut out = Vec::new();
     {
         let mut cursor = Cursor::new(&mut out);
@@ -259,6 +282,80 @@ pub fn thumbnail_for_entry(path: &SafePath, kind: MediaKind, max_side: u32) -> R
         MediaKind::Video => video_thumbnail(path, max_side),
         _ => Err(AppError::Other("no es imagen ni vídeo".into())),
     }
+}
+
+/// Directorio de caché de miniaturas en disco: `DDAMR_THUMBS_DIR`
+/// si está definida (los tests la usan para no tocar el home real),
+/// si no `~/.cache/ddamr/thumbs`. Es el mismo directorio que usa
+/// `ddamr thumbs` en el CLI, así que la app y el CLI comparten
+/// la caché.
+pub fn thumbs_cache_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("DDAMR_THUMBS_DIR")
+        && !dir.is_empty()
+    {
+        return std::path::PathBuf::from(dir);
+    }
+    std::env::var("HOME")
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".cache")
+                .join("ddamr")
+                .join("thumbs")
+        })
+        .unwrap_or_default()
+}
+
+/// Dimensiones de un JPEG sin decodificarlo: solo se lee la
+/// cabecera (`ImageReader::into_dimensions`). `None` si los bytes
+/// no son una imagen legible. Barato: no reserva el píxel.
+pub fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    use std::io::Cursor;
+    image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// Miniatura con caché en disco.
+///
+/// Orden: (1) fichero `<clave>-<max_side>.jpg` en la caché;
+/// (2) si se pide `<= 256 px` y existe el fichero `<clave>.jpg`
+/// que escribe `ddamr thumbs` (256 px), se reescala desde él en
+/// vez de decodificar el original — mucho más barato con
+/// originales grandes; (3) generar desde el original y guardar
+/// el resultado como `<clave>-<max_side>.jpg`.
+///
+/// Si la caché no está disponible (sin permisos, sin HOME…),
+/// se genera en memoria sin fallar: la caché es un acelerador,
+/// nunca un requisito.
+pub fn thumbnail_cached(path: &SafePath, kind: MediaKind, max_side: u32) -> Result<Vec<u8>> {
+    let key = thumb_cache_key(path).ok();
+    if let Some(key) = &key {
+        let dir = thumbs_cache_dir();
+        let sized = dir.join(format!("{key}-{max_side}.jpg"));
+        if let Ok(bytes) = std::fs::read(&sized) {
+            return Ok(bytes);
+        }
+        if max_side <= 256 {
+            // Reutilizar la miniatura de 256 px del CLI.
+            let cli_file = dir.join(format!("{key}.jpg"));
+            if let Ok(cached) = std::fs::read(&cli_file)
+                && let Ok(img) = image::load_from_memory(&cached)
+            {
+                let bytes = jpeg_thumbnail(&img, max_side)?;
+                let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&sized, &bytes));
+                return Ok(bytes);
+            }
+        }
+    }
+    let bytes = thumbnail_for_entry(path, kind, max_side)?;
+    if let Some(key) = &key {
+        let dir = thumbs_cache_dir();
+        let sized = dir.join(format!("{key}-{max_side}.jpg"));
+        let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&sized, &bytes));
+    }
+    Ok(bytes)
 }
 
 /// Clave de caché para la miniatura de `path`: BLAKE3 en hex de
@@ -403,6 +500,26 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_keeps_aspect_ratio() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foto.jpg");
+        image::RgbImage::new(400, 300).save(&path).unwrap();
+        let safe = SafePath::new(dir.path(), &path).unwrap();
+        let bytes = thumbnail_sized(&safe, 64).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (64, 48),
+            "400×300 a 64 px debe ser 64×48, no 64×64"
+        );
+        let vertical = dir.path().join("vert.jpg");
+        image::RgbImage::new(300, 400).save(&vertical).unwrap();
+        let safe_v = SafePath::new(dir.path(), &vertical).unwrap();
+        let decoded = image::load_from_memory(&thumbnail_sized(&safe_v, 64).unwrap()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (48, 64));
+    }
+
+    #[test]
     fn thumbnail_sized_respects_max_side() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("foto.jpg");
@@ -509,6 +626,76 @@ mod tests {
         } else {
             assert_eq!(key2, thumb_cache_key(&safe).unwrap());
         }
+    }
+
+    #[test]
+    fn jpeg_dimensions_reads_header_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foto.jpg");
+        image::RgbImage::new(400, 300).save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(jpeg_dimensions(&bytes), Some((400, 300)));
+        assert_eq!(jpeg_dimensions(b"no es una imagen"), None);
+        assert_eq!(jpeg_dimensions(&[]), None);
+    }
+
+    // Un solo test para la caché en disco: las tres escenas tocan
+    // la misma variable de entorno y no pueden correr en paralelo.
+    #[test]
+    fn thumbnail_cached_disk_cache() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("thumbs");
+        std::fs::create_dir_all(&cache).unwrap();
+        // SAFETY: este es el único test que toca DDAMR_THUMBS_DIR.
+        unsafe { std::env::set_var("DDAMR_THUMBS_DIR", &cache) };
+        // (1) Fichero `<clave>-64.jpg` ya existente: se devuelve
+        // tal cual, sin generar desde el original. El original es
+        // negro y la caché contiene una imagen blanca: el
+        // resultado debe ser blanco.
+        let path = dir.path().join("foto.jpg");
+        image::RgbImage::new(400, 300).save(&path).unwrap(); // negro
+        let safe = SafePath::new(dir.path(), &path).unwrap();
+        let key = thumb_cache_key(&safe).unwrap();
+        let white = {
+            let mut img = image::RgbImage::new(10, 10);
+            for px in img.pixels_mut() {
+                *px = image::Rgb([255, 255, 255]);
+            }
+            let mut buf = Vec::new();
+            {
+                let mut cur = std::io::Cursor::new(&mut buf);
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, 80)
+                    .encode_image(&image::DynamicImage::ImageRgb8(img))
+                    .unwrap();
+            }
+            buf
+        };
+        std::fs::write(cache.join(format!("{key}-64.jpg")), &white).unwrap();
+        let from_cache = thumbnail_cached(&safe, MediaKind::Image, 64).unwrap();
+        let decoded = image::load_from_memory(&from_cache).unwrap().to_rgb8();
+        assert_eq!(decoded.get_pixel(0, 0), &image::Rgb([255, 255, 255]));
+        // (2) Reutilización del fichero `<clave>.jpg` de 256 px
+        // del CLI: sin fichero de 64 px, se reescala desde él.
+        // El original es negro, el fichero del CLI es blanco.
+        let path2 = dir.path().join("foto2.jpg");
+        image::RgbImage::new(200, 100).save(&path2).unwrap(); // negro
+        let safe2 = SafePath::new(dir.path(), &path2).unwrap();
+        let key2 = thumb_cache_key(&safe2).unwrap();
+        std::fs::write(cache.join(format!("{key2}.jpg")), &white).unwrap();
+        let small = thumbnail_cached(&safe2, MediaKind::Image, 64).unwrap();
+        let decoded = image::load_from_memory(&small).unwrap();
+        assert!(decoded.width() <= 64 && decoded.height() <= 64);
+        assert!(
+            cache.join(format!("{key2}-64.jpg")).exists(),
+            "el reescalado se guarda como fichero de 64 px"
+        );
+        // (3) Sin directorio de caché usable: genera en memoria.
+        unsafe { std::env::set_var("DDAMR_THUMBS_DIR", "") };
+        let path3 = dir.path().join("foto3.jpg");
+        image::RgbImage::new(100, 80).save(&path3).unwrap();
+        let safe3 = SafePath::new(dir.path(), &path3).unwrap();
+        assert!(thumbnail_cached(&safe3, MediaKind::Image, 64).is_ok());
+        unsafe { std::env::remove_var("DDAMR_THUMBS_DIR") };
     }
 
     #[test]

@@ -15,6 +15,8 @@
 //! de la carpeta.
 
 use ddamr_core::Page;
+use ddamr_media::jpeg_dimensions;
+use iced::widget::image::Handle;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -91,20 +93,42 @@ pub fn window_start_for_offset(total: usize, scroll_offset_px: f32, row_height_p
     aligned.min(total - WINDOW_SIZE)
 }
 
-/// Caché LRU en memoria para miniaturas (bytes JPEG).
+/// Una miniatura en caché: el `Handle` de iced creado UNA sola
+/// vez a partir de los bytes JPEG, más sus dimensiones reales
+/// (leídas de la cabecera JPEG, sin decodificar).
+///
+/// Por qué se guarda el `Handle` y no los bytes: `Handle::from_bytes`
+/// crea `Id::unique()` en cada llamada (verificado en
+/// `iced_core-0.14.0/src/image.rs`), así que construirlo dentro de
+/// `view()` hace que cada reconstrucción de la vista — un clic,
+/// un scroll, cualquier mensaje — cree una imagen "nueva" para la
+/// caché de imágenes de iced, que la decodifica de forma asíncrona
+/// y tarda ~2 s en reaparecer. Con el `Handle` guardado aquí y
+/// clonado en `view()`, la imagen ya está decodificada y no
+/// parpadea. Los constructores de `Id` son privados, así que no
+/// hay forma de fabricar un id estable por hash: la caché del
+/// `Handle` es la única vía.
+#[derive(Debug, Clone)]
+pub struct CachedThumb {
+    pub handle: Handle,
+    /// Dimensiones reales de la miniatura (0, 0) si la cabecera
+    /// JPEG no se pudo leer (bytes no válidos).
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Caché LRU en memoria para miniaturas.
 /// Capacidad acotada: cuando se llena, se expulsa la miniatura
-/// que lleva más tiempo sin usarse. En fase 1 la UI aún no dibuja
-/// miniaturas; la caché ya está aquí para que la iteración que las
-/// dibuje no tenga que inventar el almacenamiento.
+/// que lleva más tiempo sin usarse.
 ///
 /// La clave de caché es (ruta canónica, mtime): cada entrada guarda
-/// junto a los bytes el `mtime` del archivo en el momento en que se
+/// junto al `Handle` el `mtime` del archivo en el momento en que se
 /// generó la miniatura. Si el archivo cambia, su mtime ya no
 /// coincide y la entrada se considera inválida (`get_validated`
 /// devuelve `None`), así nunca se sirve una miniatura obsoleta.
 pub struct ThumbCache {
     capacity: usize,
-    map: HashMap<PathBuf, (Vec<u8>, Option<i64>)>,
+    map: HashMap<PathBuf, (CachedThumb, Option<i64>)>,
     order: VecDeque<PathBuf>,
 }
 
@@ -126,11 +150,11 @@ impl ThumbCache {
     }
 
     /// Devuelve la miniatura y la marca como usada recientemente.
-    pub fn get(&mut self, path: &Path) -> Option<&[u8]> {
+    pub fn get(&mut self, path: &Path) -> Option<CachedThumb> {
         if self.map.contains_key(path) {
             self.order.retain(|p| p != path);
             self.order.push_back(path.to_path_buf());
-            self.map.get(path).map(|(bytes, _)| bytes.as_slice())
+            self.map.get(path).map(|(thumb, _)| thumb.clone())
         } else {
             None
         }
@@ -143,7 +167,7 @@ impl ThumbCache {
     /// también con `None`; si lo guardado es `None` y el pedido es
     /// `Some`, la entrada no es válida (el archivo cambió desde que
     /// se generó la miniatura o se desconoce su mtime actual).
-    pub fn get_validated(&mut self, path: &Path, modified_at: Option<i64>) -> Option<&[u8]> {
+    pub fn get_validated(&mut self, path: &Path, modified_at: Option<i64>) -> Option<CachedThumb> {
         let valid = self
             .map
             .get(path)
@@ -160,10 +184,10 @@ impl ThumbCache {
     /// Lectura sin tocar el orden LRU, para usarla desde `view`
     /// (que solo tiene `&self`). Misma regla de validez por mtime
     /// que `get_validated`.
-    pub fn peek_validated(&self, path: &Path, modified_at: Option<i64>) -> Option<&[u8]> {
-        let (bytes, stored) = self.map.get(path)?;
+    pub fn peek_validated(&self, path: &Path, modified_at: Option<i64>) -> Option<CachedThumb> {
+        let (thumb, stored) = self.map.get(path)?;
         if *stored == modified_at {
-            Some(bytes.as_slice())
+            Some(thumb.clone())
         } else {
             None
         }
@@ -181,9 +205,81 @@ impl ThumbCache {
                 }
             }
         }
+        // El `Handle` se crea aquí, una sola vez, y se reutiliza
+        // clonado en cada `view()`: ver el comentario de
+        // `CachedThumb`. Las dimensiones se leen de la cabecera
+        // JPEG (barato) para poder dibujar la miniatura con su
+        // proporción real dentro de su cuadrado de 64 px.
+        let (width, height) = jpeg_dimensions(&bytes).unwrap_or((0, 0));
+        let thumb = CachedThumb {
+            handle: Handle::from_bytes(bytes),
+            width,
+            height,
+        };
         self.order.push_back(path.clone());
-        self.map.insert(path, (bytes, modified_at));
+        self.map.insert(path, (thumb, modified_at));
     }
+}
+
+/// Ajusta una imagen de `orig_w` × `orig_h` dentro de un cuadrado
+/// de `side` px conservando su proporción, centrada.
+///
+/// Devuelve `(ancho, alto, offset_x, offset_y)` en px: el tamaño
+/// mostrado y su desplazamiento dentro del cuadrado. Con
+/// dimensiones desconocidas (0, 0) se devuelve el cuadrado entero.
+///
+/// No se confía solo en `ContentFit::Contain` (que en iced 0.14
+/// también preserva la proporción y centra, y es el ajuste por
+/// defecto del widget `Image`): el tamaño explícito es la
+/// garantía. `Contain` calcula el ajuste a partir de
+/// `measure_image`, que devuelve 0×0 mientras la imagen aún no
+/// está decodificada, y el `Image` con ancho y alto fijos
+/// distintos de la proporción real se distorsionaría si el modo
+/// de ajuste cambiara. Con el tamaño calculado aquí, el widget
+/// tiene exactamente la proporción real, pase lo que pase.
+pub fn fit_in_square(orig_w: u32, orig_h: u32, side: f32) -> (f32, f32, f32, f32) {
+    if orig_w == 0 || orig_h == 0 || side <= 0.0 {
+        return (side.max(0.0), side.max(0.0), 0.0, 0.0);
+    }
+    let scale = side / orig_w.max(orig_h) as f32;
+    let w = orig_w as f32 * scale;
+    let h = orig_h as f32 * scale;
+    ((w), (h), (side - w) / 2.0, (side - h) / 2.0)
+}
+
+/// Ventanas adyacentes a precargar para que el scroll no deje
+/// huecos: cuando la parte visible del viewport está a menos de
+/// `WINDOW_SIZE` filas del borde de la ventana cargada, la ventana
+/// vecina debe estar ya cargada al cruzar el borde.
+///
+/// Devuelve los inicios (alineados a múltiplos de `WINDOW_SIZE`)
+/// de las ventanas adyacentes a precargar: como mucho la anterior
+/// y la siguiente, nunca la actual, nunca fuera de `[0, total)`.
+pub fn prefetch_starts(
+    total: usize,
+    window_start: usize,
+    scroll_offset_px: f32,
+    viewport_height_px: f32,
+    row_height_px: f32,
+) -> Vec<usize> {
+    if total <= WINDOW_SIZE || row_height_px <= 0.0 {
+        return Vec::new();
+    }
+    let offset = scroll_offset_px.max(0.0);
+    let first_visible = (offset / row_height_px).floor() as usize;
+    let last_visible = ((offset + viewport_height_px.max(0.0)) / row_height_px).ceil() as usize;
+    let mut out = Vec::new();
+    if window_start >= WINDOW_SIZE && first_visible.saturating_sub(WINDOW_SIZE) < window_start {
+        out.push(window_start - WINDOW_SIZE);
+    }
+    let window_end = (window_start + WINDOW_SIZE).min(total);
+    if last_visible + WINDOW_SIZE >= window_end {
+        let next = window_start + WINDOW_SIZE;
+        if next < total {
+            out.push(next);
+        }
+    }
+    out
 }
 
 /// Escala una región en coordenadas normalizadas `0..1` a píxeles
@@ -211,6 +307,23 @@ pub fn scale_region_to_preview(
     (x_px, y_px, w_px, h_px)
 }
 
+/// Como `scale_region_to_preview`, pero para una imagen dibujada
+/// con su proporción real y centrada dentro de un área cuadrada:
+/// la región (`x, y, w, h` normalizados) se escala al tamaño
+/// MOSTRADO (`disp_w` × `disp_h`) y se desplaza por el offset de
+/// centrado (`offset_x`, `offset_y`) dentro del área. Sin el
+/// offset, los rectángulos quedarían desplazados en imágenes
+/// panorámicas o verticales.
+pub fn scale_region_to_displayed(
+    region: (f64, f64, f64, f64),
+    displayed: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = region;
+    let (offset_x, offset_y, disp_w, disp_h) = displayed;
+    let (rx, ry, rw, rh) = scale_region_to_preview(x, y, w, h, disp_w, disp_h);
+    (rx + offset_x, ry + offset_y, rw, rh)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,10 +343,7 @@ mod tests {
         cache.insert(PathBuf::from("b"), vec![2]);
         // `peek_validated` lee sin marcar como usada: "a" sigue
         // siendo la menos reciente y es la expulsada al insertar.
-        assert_eq!(
-            cache.peek_validated(Path::new("a"), None),
-            Some([1].as_slice())
-        );
+        assert!(cache.peek_validated(Path::new("a"), None).is_some());
         cache.insert(PathBuf::from("c"), vec![3]);
         assert!(cache.get(Path::new("a")).is_none());
         assert!(cache.get(Path::new("b")).is_some());
@@ -245,13 +355,35 @@ mod tests {
         let mut cache = ThumbCache::new(2);
         cache.insert(PathBuf::from("a"), vec![1]);
         cache.insert(PathBuf::from("b"), vec![2]);
-        assert_eq!(cache.get(Path::new("a")), Some([1].as_slice()));
+        assert!(cache.get(Path::new("a")).is_some());
         cache.insert(PathBuf::from("c"), vec![3]);
         assert_eq!(cache.len(), 2);
         // "a" se usó hace poco, así que la expulsada es "b".
         assert!(cache.get(Path::new("b")).is_none());
         assert!(cache.get(Path::new("a")).is_some());
         assert!(cache.get(Path::new("c")).is_some());
+    }
+
+    #[test]
+    fn thumb_cache_stores_handle_and_dimensions_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("foto.jpg");
+        image::RgbImage::new(400, 300).save(&path).unwrap();
+        let safe = ddamr_core::SafePath::new(dir.path(), &path).unwrap();
+        let bytes = ddamr_media::thumbnail_sized(&safe, 64).unwrap();
+        let mut cache = ThumbCache::new(4);
+        cache.insert_with_mtime(path.clone(), bytes, Some(1000));
+        let thumb = cache
+            .peek_validated(&path, Some(1000))
+            .expect("la miniatura debe estar en caché");
+        // Dimensiones reales de la cabecera JPEG, no un cuadrado:
+        // 400×300 a 64 px de lado mayor es 64×48.
+        assert_eq!((thumb.width, thumb.height), (64, 48));
+        // El `Handle` se reutiliza: dos lecturas devuelven el
+        // mismo id (si `from_bytes` se llamara en cada lectura,
+        // cada una tendría un id distinto y la imagen parpadearía).
+        let again = cache.peek_validated(&path, Some(1000)).unwrap();
+        assert_eq!(thumb.handle, again.handle);
     }
 
     #[test]
@@ -337,20 +469,14 @@ mod tests {
         let mut cache = ThumbCache::new(8);
         cache.insert_with_mtime(PathBuf::from("a"), vec![1], Some(1000));
         // Mismo mtime: válida.
-        assert_eq!(
-            cache.get_validated(Path::new("a"), Some(1000)),
-            Some([1].as_slice())
-        );
+        assert!(cache.get_validated(Path::new("a"), Some(1000)).is_some());
         // Mtime distinto: inválida (el archivo cambió).
         assert!(cache.get_validated(Path::new("a"), Some(2000)).is_none());
         // Pedido None contra guardado Some: inválida.
         assert!(cache.get_validated(Path::new("a"), None).is_none());
         // Guardado None y pedido None: válida.
         cache.insert_with_mtime(PathBuf::from("b"), vec![2], None);
-        assert_eq!(
-            cache.get_validated(Path::new("b"), None),
-            Some([2].as_slice())
-        );
+        assert!(cache.get_validated(Path::new("b"), None).is_some());
         // Guardado None y pedido Some: inválida.
         assert!(cache.get_validated(Path::new("b"), Some(1000)).is_none());
     }
@@ -360,13 +486,69 @@ mod tests {
         let mut cache = ThumbCache::new(8);
         cache.insert(PathBuf::from("a"), vec![1]);
         // get clásico sigue funcionando tras insert clásico.
-        assert_eq!(cache.get(Path::new("a")), Some([1].as_slice()));
+        assert!(cache.get(Path::new("a")).is_some());
         // insert clásico guarda mtime None: solo válido con None.
-        assert_eq!(
-            cache.get_validated(Path::new("a"), None),
-            Some([1].as_slice())
-        );
+        assert!(cache.get_validated(Path::new("a"), None).is_some());
         assert!(cache.get_validated(Path::new("a"), Some(1000)).is_none());
+    }
+
+    #[test]
+    fn fit_in_square_keeps_aspect_and_centers() {
+        // Panorámica 2:1 en 64 px: 64×32, centrada verticalmente.
+        assert_eq!(fit_in_square(400, 200, 64.0), (64.0, 32.0, 0.0, 16.0));
+        // Vertical 1:2 en 64 px: 32×64, centrada horizontalmente.
+        assert_eq!(fit_in_square(200, 400, 64.0), (32.0, 64.0, 16.0, 0.0));
+        // Cuadrada: ocupa todo el cuadrado.
+        assert_eq!(fit_in_square(100, 100, 64.0), (64.0, 64.0, 0.0, 0.0));
+        // Panorámica 2:1 en el preview de 284 px: 284×142.
+        assert_eq!(fit_in_square(400, 200, 284.0), (284.0, 142.0, 0.0, 71.0));
+        // Vertical 1:2 en 284 px: 142×284.
+        assert_eq!(fit_in_square(200, 400, 284.0), (142.0, 284.0, 71.0, 0.0));
+        // Sin dimensiones: el cuadrado entero (fallback).
+        assert_eq!(fit_in_square(0, 0, 64.0), (64.0, 64.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn scale_region_to_displayed_adds_centering_offset() {
+        // Imagen panorámica 2:1 en un área de 284 px: se dibuja
+        // en 284×142 con offset vertical 71. La región (0.25,
+        // 0.1, 0.5, 0.2) ocupa (71, 14.2, 142, 28.4) dentro de la
+        // imagen, así que en el área queda en (71, 85.2).
+        let (x, y, w, h) =
+            scale_region_to_displayed((0.25, 0.1, 0.5, 0.2), (0.0, 71.0, 284.0, 142.0));
+        assert!((x - 71.0).abs() < 0.001);
+        assert!((y - 85.2).abs() < 0.001);
+        assert!((w - 142.0).abs() < 0.001);
+        assert!((h - 28.4).abs() < 0.001);
+        // Sin offset coincide con el escalado directo.
+        assert_eq!(
+            scale_region_to_displayed((0.25, 0.1, 0.5, 0.2), (0.0, 0.0, 320.0, 240.0)),
+            scale_region_to_preview(0.25, 0.1, 0.5, 0.2, 320.0, 240.0)
+        );
+    }
+
+    #[test]
+    fn prefetch_starts_near_window_edges() {
+        // Al inicio, con el viewport en la fila 0: la siguiente
+        // ventana (60) está a menos de 60 filas del final visible.
+        assert_eq!(
+            prefetch_starts(5000, 0, 0.0, 720.0, ROW_HEIGHT_PX),
+            vec![60]
+        );
+        // A la mitad de una ventana: anterior y siguiente.
+        assert_eq!(
+            prefetch_starts(5000, 2460, 180_000.0, 720.0, ROW_HEIGHT_PX),
+            vec![2400, 2520]
+        );
+        // Cerca del final: solo la anterior.
+        let end_offset = 4940.0 * ROW_HEIGHT_PX;
+        assert_eq!(
+            prefetch_starts(5000, 4940, end_offset, 720.0, ROW_HEIGHT_PX),
+            vec![4880]
+        );
+        // Carpeta pequeña: no hay nada que precargar.
+        assert!(prefetch_starts(30, 0, 0.0, 720.0, ROW_HEIGHT_PX).is_empty());
+        assert!(prefetch_starts(60, 0, 0.0, 720.0, ROW_HEIGHT_PX).is_empty());
     }
 
     #[test]
