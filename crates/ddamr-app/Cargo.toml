@@ -12,9 +12,10 @@ ddamr-core = { workspace = true }
 ddamr-db = { workspace = true }
 ddamr-fs = { workspace = true }
 ddamr-index = { workspace = true }
+ddamr-media = { workspace = true }
 ddamr-metadata = { workspace = true }
 rusqlite = { workspace = true }
-iced = "0.14"
+iced = { version = "0.14", features = ["image"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

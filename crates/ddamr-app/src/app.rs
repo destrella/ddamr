@@ -8,10 +8,12 @@ use crate::metadata_edit::{
     EditForm, EditOutcome, apply_metadata_edit, build_patch, open_app_db, parse_lat_lon,
     parse_region_pct, sync_tags,
 };
-use crate::virtual_list::{ThumbCache, page_slice};
+use crate::virtual_list::{
+    ROW_HEIGHT_PX, ThumbCache, WINDOW_SIZE, scale_region_to_preview, window_start_for_offset,
+};
 use ddamr_core::{
-    AppError, Config, FileFilter, Page, PageResult, SafePath, SortKey, SortOrder, format_size,
-    format_timestamp_ms,
+    AppError, Config, FileFilter, MediaKind, Page, PageResult, SafePath, SortKey, SortOrder,
+    format_size, format_timestamp_ms,
 };
 use ddamr_db::repos::{
     Location, LocationRepo, LocationSort, Region, RegionRepo, Tag, TagRepo, file_id_for_path,
@@ -22,12 +24,24 @@ use ddamr_fs::{
 use ddamr_index::{
     DuplicateGroup, DuplicateKind, FileInfo, default_db_path, find_duplicates_with_root,
 };
+use ddamr_media::thumbnail_for_entry;
 use ddamr_metadata::{BasicMetadata, read_basic, write_metadata};
 use iced::keyboard::{Key, key::Named};
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::image::Handle;
+use iced::widget::{Image, button, column, container, row, scrollable, stack, text, text_input};
 use iced::{Element, Length, Task};
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+/// Ancho del preview de la columna de info (la columna mide 300 px).
+const PREVIEW_WIDTH_PX: f32 = 284.0;
+
+/// Vista previa grande del archivo seleccionado (JPEG 320 px).
+#[derive(Debug, Clone)]
+pub struct PreviewImage {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
 
 /// Vista principal: el explorador de la fase 1 o la vista de
 /// duplicados de la fase 2.
@@ -91,6 +105,18 @@ pub enum Message {
     KeyPressed(Key),
     /// Metadatos del archivo seleccionado, cargados en segundo plano.
     SelectedMetadataLoaded(BasicMetadata),
+    // ---- Miniaturas y lista virtualizada (fase 3a) ----
+    /// Un lote de miniaturas de 64 px: (ruta, mtime, bytes o None
+    /// si falló — en ese caso no se reintenta en esta sesión).
+    ThumbnailsLoaded(Vec<(PathBuf, Option<i64>, Option<Vec<u8>>)>),
+    /// Offset vertical de scroll del panel de contenido, en px.
+    ScrollChanged(f32),
+    /// Vista previa grande (320 px) del seleccionado, o None si
+    /// no se pudo generar (sin reintento en esta sesión).
+    PreviewLoaded(PathBuf, Option<Vec<u8>>),
+    /// Región seleccionada en la lista: su rectángulo se resalta
+    /// en el preview. Repetir la deselecciona.
+    SelectRegion(i64),
     // ---- Vista de duplicados (fase 2) ----
     ShowBrowser,
     ShowDuplicates,
@@ -186,9 +212,23 @@ pub struct App {
     pub status_msg: String,
     pub view_mode: ViewMode,
     pub selected_metadata: Option<BasicMetadata>,
-    /// Caché LRU de miniaturas, lista para la iteración que las dibuje.
-    #[allow(dead_code)]
+    /// Caché LRU de miniaturas de 64 px (clave: ruta + mtime).
     pub thumb_cache: ThumbCache,
+    /// Rutas cuya miniatura falló en esta sesión: no se reintenta.
+    pub thumb_failed: HashSet<PathBuf>,
+    /// Offset vertical de scroll del panel de contenido, en px.
+    pub scroll_offset_px: f32,
+    /// Ventana pedida y aún no cargada (su inicio absoluto).
+    pub pending_window_start: Option<usize>,
+    /// Índice dentro de la ventana pendiente (navegación con
+    /// flechas que cruza de ventana).
+    pub pending_selected_index: Option<usize>,
+    /// Vista previa grande del archivo seleccionado.
+    pub preview: Option<PreviewImage>,
+    /// Rutas cuya vista previa falló en esta sesión.
+    pub preview_failed: HashSet<PathBuf>,
+    /// Región resaltada en el preview (id de `regions`).
+    pub selected_region: Option<i64>,
     // ---- Vista de duplicados (fase 2) ----
     pub view: View,
     pub confirm_dialog: Option<ConfirmKind>,
@@ -258,6 +298,13 @@ impl Default for App {
             view_mode: ViewMode::List,
             selected_metadata: None,
             thumb_cache: ThumbCache::new(128),
+            thumb_failed: HashSet::new(),
+            scroll_offset_px: 0.0,
+            pending_window_start: None,
+            pending_selected_index: None,
+            preview: None,
+            preview_failed: HashSet::new(),
+            selected_region: None,
             view: View::Browser,
             confirm_dialog: None,
             duplicates: Vec::new(),
@@ -302,13 +349,30 @@ impl App {
         }
     }
 
-    /// Carga la página actual del directorio seleccionado, en un Task.
+    /// Fila absoluta (en todo el directorio) de la primera fila
+    /// de la ventana cargada en `entries`.
+    fn window_start(&self) -> usize {
+        self.entries.page.offset
+    }
+
+    /// Carga la ventana de `WINDOW_SIZE` filas que empieza en
+    /// `start`, en un Task. `self.page` sigue siendo la "página"
+    /// de 200 para la paginación y el contador de páginas.
+    fn load_window(&mut self, start: usize) -> Task<Message> {
+        self.page = Page::new(start, Page::DEFAULT_LIMIT);
+        self.load_entries_task()
+    }
+
+    /// Carga la ventana actual del directorio seleccionado, en un
+    /// Task. La ventana es de `WINDOW_SIZE` filas, no la página
+    /// entera de 200: con 5.000 archivos nunca se materializan
+    /// más de 60 entradas a la vez.
     fn load_entries_task(&self) -> Task<Message> {
         let dir = self.selected_dir.clone();
         let filter = self.filter.clone();
         let sort = self.sort;
         let order = self.sort_order;
-        let page = self.page;
+        let page = Page::new(self.page.offset, WINDOW_SIZE);
         Task::perform(
             async move { list_dir(&dir, &filter, sort, order, page) },
             move |result| match result {
@@ -318,26 +382,98 @@ impl App {
         )
     }
 
-    /// Metadatos del archivo seleccionado, en un Task.
+    /// Metadatos del archivo seleccionado, en un Task, junto con
+    /// su vista previa grande (que se genera en paralelo).
     fn metadata_task(&self) -> Task<Message> {
         let Some(entry) = self.entries.items.get(self.selected_index) else {
             return Task::none();
         };
         let path = entry.path.clone();
-        Task::perform(
+        let meta = Task::perform(
             async move { read_basic(&path) },
             Message::SelectedMetadataLoaded,
+        );
+        Task::batch([meta, self.preview_task()])
+    }
+
+    /// Filas de la ventana que aún no tienen miniatura (imagen o
+    /// vídeo, sin fallos previos en esta sesión), como mucho 12:
+    /// la generación va en lotes para no saturar el arranque de
+    /// la ventana.
+    fn thumbs_needed(&self) -> Vec<(SafePath, MediaKind, Option<i64>)> {
+        self.entries
+            .items
+            .iter()
+            .filter(|e| matches!(e.kind, MediaKind::Image | MediaKind::Video))
+            .filter(|e| !self.thumb_failed.contains(e.path.path()))
+            .filter(|e| {
+                self.thumb_cache
+                    .peek_validated(e.path.path(), e.modified_at)
+                    .is_none()
+            })
+            .take(12)
+            .map(|e| (e.path.clone(), e.kind, e.modified_at))
+            .collect()
+    }
+
+    /// Genera el siguiente lote de miniaturas de 64 px, en un Task.
+    fn thumbs_task(&self) -> Task<Message> {
+        let needed = self.thumbs_needed();
+        if needed.is_empty() {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                let mut out = Vec::new();
+                for (path, kind, mtime) in needed {
+                    let bytes = thumbnail_for_entry(&path, kind, 64).ok();
+                    out.push((path.path().to_path_buf(), mtime, bytes));
+                }
+                Message::ThumbnailsLoaded(out)
+            },
+            |m| m,
+        )
+    }
+
+    /// Vista previa grande (320 px) del archivo seleccionado, en
+    /// un Task. No se genera si ya está cargada para esa ruta o
+    /// si ya falló en esta sesión; tampoco para no-imágenes.
+    fn preview_task(&self) -> Task<Message> {
+        let Some(entry) = self.entries.items.get(self.selected_index) else {
+            return Task::none();
+        };
+        if !matches!(entry.kind, MediaKind::Image | MediaKind::Video) {
+            return Task::none();
+        }
+        let path = entry.path.path().to_path_buf();
+        if self.preview.as_ref().is_some_and(|p| p.path == path)
+            || self.preview_failed.contains(&path)
+        {
+            return Task::none();
+        }
+        let safe = entry.path.clone();
+        let kind = entry.kind;
+        Task::perform(
+            async move {
+                let bytes = thumbnail_for_entry(&safe, kind, 320).ok();
+                Message::PreviewLoaded(path, bytes)
+            },
+            |m| m,
         )
     }
 
     /// Al cambiar de selección, los cambios sin guardar se
     /// descartan silenciosamente y el formulario, las secciones
     /// de la DB y los campos de alta se vacían: se recargan con
-    /// la nueva selección (metadatos → detalles).
+    /// la nueva selección (metadatos → detalles). También se
+    /// descarta la vista previa y la región resaltada, que
+    /// pertenecen a la selección anterior.
     fn selection_changed(&mut self) {
         self.edit_form = EditForm::default();
         self.edit_form_path = None;
         self.selected_details = None;
+        self.preview = None;
+        self.selected_region = None;
         self.db_details_error = None;
         self.new_tag.clear();
         self.new_loc_name.clear();
@@ -415,18 +551,35 @@ impl App {
         )
     }
 
+    /// Mueve la selección por filas absolutas del directorio. Si
+    /// la fila destino está en la ventana cargada, solo cambia el
+    /// índice; si cae en otra ventana, carga esa ventana y deja
+    /// la selección pendiente hasta que llegue (`EntriesLoaded`
+    /// la aplica). En los extremos no se mueve.
     fn move_selection(&mut self, delta: isize) -> Task<Message> {
-        if self.entries.items.is_empty() {
+        if self.entries.items.is_empty() || self.entries.total == 0 {
             return Task::none();
         }
-        let max = self.entries.items.len() - 1;
-        let next = self.selected_index as isize + delta;
-        let next = next.clamp(0, max as isize) as usize;
-        if next != self.selected_index {
-            self.selected_index = next;
-            self.selection_changed();
+        let abs = self.window_start() + self.selected_index;
+        let next_abs = (abs as isize + delta).clamp(0, self.entries.total as isize - 1) as usize;
+        if next_abs == abs {
+            return Task::none();
         }
-        self.metadata_task()
+        let start = self.window_start();
+        if next_abs >= start && next_abs < start + self.entries.items.len() {
+            self.selected_index = next_abs - start;
+            self.selection_changed();
+            return self.metadata_task();
+        }
+        let new_start = window_start_for_offset(
+            self.entries.total,
+            next_abs as f32 * ROW_HEIGHT_PX,
+            ROW_HEIGHT_PX,
+        );
+        self.pending_selected_index = Some(next_abs - new_start);
+        self.pending_window_start = Some(new_start);
+        self.selection_changed();
+        self.load_window(new_start)
     }
 
     fn toggle_current(&mut self) -> Task<Message> {
@@ -579,7 +732,15 @@ impl App {
             Message::EntriesLoaded(page_result) => {
                 let total = page_result.total;
                 self.entries = page_result;
-                self.selected_index = 0;
+                // Navegación con flechas que cruzó de ventana: la
+                // selección pendiente se aplica ahora, dentro de
+                // la ventana recién cargada.
+                self.selected_index = self
+                    .pending_selected_index
+                    .take()
+                    .unwrap_or(0)
+                    .min(self.entries.items.len().saturating_sub(1));
+                self.pending_window_start = None;
                 self.selected_metadata = None;
                 self.selection_changed();
                 self.status_msg = format!(
@@ -588,7 +749,57 @@ impl App {
                     self.page.index() + 1,
                     self.total_pages()
                 );
-                self.metadata_task()
+                Task::batch([self.metadata_task(), self.thumbs_task()])
+            }
+            Message::ScrollChanged(offset) => {
+                self.scroll_offset_px = offset;
+                if self.entries.total == 0 {
+                    return Task::none();
+                }
+                let start = window_start_for_offset(self.entries.total, offset, ROW_HEIGHT_PX);
+                if start != self.window_start() && self.pending_window_start != Some(start) {
+                    self.pending_window_start = Some(start);
+                    self.pending_selected_index = None;
+                    self.load_window(start)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::ThumbnailsLoaded(results) => {
+                for (path, mtime, bytes) in results {
+                    match bytes {
+                        Some(b) => self.thumb_cache.insert_with_mtime(path, b, mtime),
+                        None => {
+                            self.thumb_failed.insert(path);
+                        }
+                    }
+                }
+                // Seguir con el siguiente lote de la ventana, si
+                // quedan filas sin miniatura.
+                self.thumbs_task()
+            }
+            Message::PreviewLoaded(path, bytes) => {
+                let Some(entry) = self.entries.items.get(self.selected_index) else {
+                    return Task::none();
+                };
+                if *entry.path.path() != path {
+                    return Task::none(); // la selección ya cambió
+                }
+                match bytes {
+                    Some(b) => self.preview = Some(PreviewImage { path, bytes: b }),
+                    None => {
+                        self.preview_failed.insert(path);
+                    }
+                }
+                Task::none()
+            }
+            Message::SelectRegion(id) => {
+                if self.selected_region == Some(id) {
+                    self.selected_region = None;
+                } else {
+                    self.selected_region = Some(id);
+                }
+                Task::none()
             }
             Message::SelectNext => self.move_selection(1),
             Message::SelectPrev => self.move_selection(-1),
@@ -634,16 +845,18 @@ impl App {
             }
             Message::NextPage => {
                 if self.page.index() + 1 < self.total_pages() {
-                    self.page = Page::at(self.page.index() + 1);
-                    self.load_entries_task()
+                    // Salto de una página (200 filas): la ventana
+                    // cargada empieza en ese offset.
+                    let start = (self.page.index() + 1) * Page::DEFAULT_LIMIT;
+                    self.load_window(start)
                 } else {
                     Task::none()
                 }
             }
             Message::PrevPage => {
                 if self.page.index() > 0 {
-                    self.page = Page::at(self.page.index() - 1);
-                    self.load_entries_task()
+                    let start = (self.page.index() - 1) * Page::DEFAULT_LIMIT;
+                    self.load_window(start)
                 } else {
                     Task::none()
                 }
@@ -1352,42 +1565,115 @@ impl App {
         scrollable(col).width(Length::Fill).into()
     }
 
+    /// Lista virtualizada: solo se construyen los widgets de la
+    /// ventana cargada (`WINDOW_SIZE` filas como máximo). Dos
+    /// espaciadores con la altura de las filas no cargadas — antes
+    /// y después de la ventana — mantienen la altura total del
+    /// contenido en `total × 72 px`, así la barra de scroll
+    /// refleja toda la carpeta y `on_scroll` (iced 0.14, con
+    /// `Viewport::absolute_offset`) carga la ventana que toca al
+    /// desplazarse. Con 5.000 archivos nunca se construyen 5.000
+    /// filas, solo las ~60 de la ventana.
     fn list_view(&self) -> Element<'_, Message> {
-        let mut col = column![].spacing(2);
-        for (i, entry) in page_slice(&self.entries.items, self.entries.page)
-            .iter()
-            .enumerate()
-        {
-            let marker = if i == self.selected_index {
-                "▶ "
-            } else if self.selected.contains(entry.path.path()) {
-                "✓ "
-            } else {
-                "  "
-            };
-            let line = format!(
-                "{marker}{}  .{}  {}  {}",
-                entry.name_without_ext,
-                entry.ext,
-                format_size(entry.size_bytes),
-                format_timestamp_ms(entry.modified_at)
-            );
-            col = col.push(
-                button(text(line).size(13))
-                    .on_press(Message::ToggleSelect(i))
-                    .width(Length::Fill),
-            );
-        }
+        let total = self.entries.total;
+        let start = self.window_start();
+        let mut col = column![].spacing(0);
         if self.entries.items.is_empty() {
             col = col.push(text("Sin archivos en esta carpeta con los filtros actuales.").size(13));
+        } else {
+            let top_h = start as f32 * ROW_HEIGHT_PX;
+            if top_h > 0.0 {
+                col = col.push(Self::spacer(top_h));
+            }
+            for (i, entry) in self.entries.items.iter().enumerate() {
+                col = col.push(self.entry_row(i, entry));
+            }
+            let bottom_rows = total.saturating_sub(start + self.entries.items.len());
+            let bottom_h = bottom_rows as f32 * ROW_HEIGHT_PX;
+            if bottom_h > 0.0 {
+                col = col.push(Self::spacer(bottom_h));
+            }
         }
-        scrollable(col).width(Length::Fill).into()
+        scrollable(col)
+            .width(Length::Fill)
+            .on_scroll(|viewport| Message::ScrollChanged(viewport.absolute_offset().y))
+            .into()
     }
 
-    /// Columna derecha (fase 2b): información de solo lectura
-    /// arriba, formulario de edición de metadatos, etiquetas,
-    /// ubicación y regiones. Sin miniatura dibujada todavía: las
-    /// regiones son lista + formulario, sin overlay gráfico.
+    /// Espaciador invisible de altura fija (filas no cargadas).
+    fn spacer(height_px: f32) -> Element<'static, Message> {
+        container(text(""))
+            .height(Length::Fixed(height_px))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Una fila de 72 px: miniatura de 64 px (o placeholder con
+    /// el tipo) a la izquierda del nombre. La miniatura se lee
+    /// de la caché sin tocar el orden LRU (`peek_validated`):
+    /// `view` solo tiene `&self`.
+    fn entry_row(&self, i: usize, entry: &FileEntry) -> Element<'_, Message> {
+        let thumb: Element<'_, Message> = match entry.kind {
+            MediaKind::Image | MediaKind::Video => {
+                match self
+                    .thumb_cache
+                    .peek_validated(entry.path.path(), entry.modified_at)
+                {
+                    Some(bytes) => Image::new(Handle::from_bytes(bytes.to_vec()))
+                        .width(Length::Fixed(64.0))
+                        .height(Length::Fixed(64.0))
+                        .into(),
+                    None => {
+                        let label = if entry.kind == MediaKind::Video {
+                            "[VID]"
+                        } else {
+                            "[IMG]"
+                        };
+                        container(text(label).size(11))
+                            .width(Length::Fixed(64.0))
+                            .height(Length::Fixed(64.0))
+                            .center_x(Length::Fixed(64.0))
+                            .center_y(Length::Fixed(64.0))
+                            .into()
+                    }
+                }
+            }
+            _ => container(text("[ ]").size(11))
+                .width(Length::Fixed(64.0))
+                .height(Length::Fixed(64.0))
+                .center_x(Length::Fixed(64.0))
+                .center_y(Length::Fixed(64.0))
+                .into(),
+        };
+        let marker = if i == self.selected_index {
+            "▶ "
+        } else if self.selected.contains(entry.path.path()) {
+            "✓ "
+        } else {
+            "  "
+        };
+        let line = format!(
+            "{marker}{}  .{}  {}  {}",
+            entry.name_without_ext,
+            entry.ext,
+            format_size(entry.size_bytes),
+            format_timestamp_ms(entry.modified_at)
+        );
+        button(
+            row![thumb, text(line).size(13)]
+                .spacing(8)
+                .height(Length::Fixed(ROW_HEIGHT_PX)),
+        )
+        .on_press(Message::ToggleSelect(i))
+        .width(Length::Fill)
+        .height(Length::Fixed(ROW_HEIGHT_PX))
+        .into()
+    }
+
+    /// Columna derecha (fase 3a): información de solo lectura
+    /// arriba, vista previa grande con overlay de regiones,
+    /// formulario de edición de metadatos, etiquetas, ubicación
+    /// y regiones.
     fn info_view(&self) -> Element<'_, Message> {
         let Some(entry) = self.entries.items.get(self.selected_index) else {
             return column![text("Sin selección").size(14)].spacing(6).into();
@@ -1424,6 +1710,9 @@ impl App {
             .size(13),
         ]
         .spacing(6);
+        // ---- Vista previa grande con overlay de regiones ----
+        col = col.push(text("Vista previa").size(14));
+        col = col.push(self.preview_view());
         // ---- Edición de metadatos ----
         col = col.push(text("Editar metadatos").size(14));
         col = col.push(
@@ -1479,6 +1768,96 @@ impl App {
         col = col.push(text("Regiones").size(14));
         col = self.push_regions_section(col);
         scrollable(col).width(Length::Fill).into()
+    }
+
+    /// Vista previa grande del archivo seleccionado, con las
+    /// regiones dibujadas encima como rectángulos con su nombre.
+    ///
+    /// Elección de implementación: un `stack` con la imagen de
+    /// fondo y, por cada región, un `container` de tamaño fijo
+    /// (el del preview) con `padding` izquierdo/superior igual
+    /// a la posición escalada, cuyo hijo es el rectángulo con
+    /// borde. Se descartó `canvas`: dibujar la imagen en un
+    /// `canvas::Frame` en iced 0.14 exige convertir el JPEG a
+    /// `Handle` igualmente y gestionar el `Program` con su
+    /// propio estado, sin ventaja frente al `stack` para
+    /// rectángulos estáticos; el `stack` compone con el resto
+    /// de la vista sin estado extra.
+    fn preview_view(&self) -> Element<'_, Message> {
+        let Some(entry) = self.entries.items.get(self.selected_index) else {
+            return text("Sin selección").size(12).into();
+        };
+        if !matches!(entry.kind, MediaKind::Image | MediaKind::Video) {
+            return text("Sin vista previa para este tipo de archivo.")
+                .size(12)
+                .into();
+        }
+        let Some(preview) = &self.preview else {
+            if self.preview_failed.contains(entry.path.path()) {
+                return text("No se pudo generar la vista previa.").size(12).into();
+            }
+            return text("Cargando vista previa…").size(12).into();
+        };
+        if preview.path != *entry.path.path() {
+            return text("Cargando vista previa…").size(12).into();
+        }
+        // Tamaño mostrado: ancho fijo, alto según la proporción
+        // real de la imagen (de los metadatos, si se conocen).
+        let (w, h) = self
+            .selected_metadata
+            .as_ref()
+            .and_then(|m| m.width.zip(m.height))
+            .unwrap_or((320, 320));
+        let disp_w = PREVIEW_WIDTH_PX;
+        let disp_h = (disp_w * h as f32 / w.max(1) as f32).clamp(40.0, 400.0);
+        let img = Image::new(Handle::from_bytes(preview.bytes.clone()))
+            .width(Length::Fixed(disp_w))
+            .height(Length::Fixed(disp_h));
+        let mut st = stack![img];
+        if let Some(details) = &self.selected_details {
+            for region in &details.regions {
+                let (x, y, rw, rh) =
+                    scale_region_to_preview(region.x, region.y, region.w, region.h, disp_w, disp_h);
+                if rw <= 0.0 || rh <= 0.0 {
+                    continue;
+                }
+                let highlighted = self.selected_region == Some(region.id);
+                let border_color = if highlighted {
+                    iced::Color::from_rgb(1.0, 0.25, 0.25)
+                } else {
+                    iced::Color::from_rgb(0.2, 0.6, 1.0)
+                };
+                let border_width = if highlighted { 3.0 } else { 1.5 };
+                let rect = container(text(&region.name).size(10))
+                    .width(Length::Fixed(rw.max(1.0)))
+                    .height(Length::Fixed(rh.max(1.0)))
+                    .style(move |_theme: &iced::Theme| container::Style {
+                        text_color: Some(border_color),
+                        background: None,
+                        border: iced::Border {
+                            color: border_color,
+                            width: border_width,
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    });
+                // El `container` exterior tiene el tamaño del
+                // preview y su `padding` coloca el rectángulo en
+                // su posición: el hijo se dibuja dentro del área
+                // de contenido, desplazado (x, y).
+                let placed = container(rect)
+                    .width(Length::Fixed(disp_w))
+                    .height(Length::Fixed(disp_h))
+                    .padding(iced::Padding {
+                        top: y,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: x,
+                    });
+                st = st.push(placed);
+            }
+        }
+        st.into()
     }
 
     /// Sección de etiquetas dentro de `info_view`.
@@ -1632,17 +2011,26 @@ impl App {
             col = col.push(text("Sin regiones.").size(12));
         }
         for region in &details.regions {
+            // Pulsar el nombre resalta su rectángulo en el preview.
+            let mark = if self.selected_region == Some(region.id) {
+                "▶ "
+            } else {
+                ""
+            };
             col = col.push(
                 row![
-                    text(format!(
-                        "{} — {:.1}%, {:.1}% · {:.1}×{:.1}%",
-                        region.name,
-                        region.x * 100.0,
-                        region.y * 100.0,
-                        region.w * 100.0,
-                        region.h * 100.0
-                    ))
-                    .size(12),
+                    button(
+                        text(format!(
+                            "{mark}{} — {:.1}%, {:.1}% · {:.1}×{:.1}%",
+                            region.name,
+                            region.x * 100.0,
+                            region.y * 100.0,
+                            region.w * 100.0,
+                            region.h * 100.0
+                        ))
+                        .size(12)
+                    )
+                    .on_press(Message::SelectRegion(region.id)),
                     button(text("×").size(12)).on_press(Message::RemoveRegion(region.id)),
                 ]
                 .spacing(6),
@@ -2356,6 +2744,99 @@ mod tests {
         assert!(app.status_msg.contains("latitud"));
         let _ = app.update(Message::LocationOpDone(Err("DB: boom".into())));
         assert!(!app.db_available);
+    }
+
+    // ---- Fase 3a: miniaturas, preview y lista virtualizada ----
+
+    #[test]
+    fn thumbnails_loaded_updates_cache_and_marks_failures() {
+        let (mut app, _dir) = app_with_entries(&["a.jpg", "b.jpg"]);
+        let path_a = app.entries.items[0].path.path().to_path_buf();
+        let path_b = app.entries.items[1].path.path().to_path_buf();
+        let mtime_a = app.entries.items[0].modified_at;
+        let _ = app.update(Message::ThumbnailsLoaded(vec![
+            (path_a.clone(), mtime_a, Some(vec![0xFF, 0xD8, 0xFF, 0xD9])),
+            (path_b.clone(), None, None),
+        ]));
+        assert!(
+            app.thumb_cache.peek_validated(&path_a, mtime_a).is_some(),
+            "la miniatura generada queda en caché"
+        );
+        assert!(app.thumb_failed.contains(&path_b), "el fallo se marca");
+        // Sin reintento en esta sesión: ni la fallida ni la ya
+        // cacheada se vuelven a pedir.
+        let needed = app.thumbs_needed();
+        assert!(
+            needed.iter().all(|(p, _, _)| p.path() != path_a),
+            "a ya está en caché"
+        );
+        assert!(
+            needed.iter().all(|(p, _, _)| p.path() != path_b),
+            "b falló y no se reintenta"
+        );
+    }
+
+    #[test]
+    fn select_region_toggles_highlight() {
+        let (mut app, _dir) = app_with_meta();
+        assert!(app.selected_region.is_none());
+        let _ = app.update(Message::SelectRegion(7));
+        assert_eq!(app.selected_region, Some(7));
+        let _ = app.update(Message::SelectRegion(7));
+        assert!(app.selected_region.is_none(), "repetir deselecciona");
+        let _ = app.update(Message::SelectRegion(3));
+        assert_eq!(app.selected_region, Some(3));
+    }
+
+    #[test]
+    fn scroll_changed_requests_new_window_only_when_needed() {
+        let mut app = paged_app(5000);
+        // Desplazar hasta la fila 300: ventana alineada a 60.
+        let _ = app.update(Message::ScrollChanged(72.0 * 300.0));
+        assert_eq!(app.scroll_offset_px, 72.0 * 300.0);
+        assert_eq!(app.pending_window_start, Some(300));
+        // Un scroll pequeño dentro de la ventana 0 no pide nada.
+        let mut app = paged_app(5000);
+        let _ = app.update(Message::ScrollChanged(72.0 * 10.0));
+        assert_eq!(app.pending_window_start, None);
+    }
+
+    #[test]
+    fn move_selection_across_window_loads_next_window() {
+        let mut app = paged_app(5000);
+        app.selected_index = 199; // última fila de la ventana 0
+        let _ = app.update(Message::SelectNext);
+        // La fila 200 cae en la ventana 180..240 (alineada a 60).
+        assert_eq!(app.pending_window_start, Some(180));
+        assert_eq!(app.pending_selected_index, Some(20));
+        // Simular la carga de esa ventana: 60 filas desde 180.
+        let entry = app.entries.items[0].clone();
+        let page = Page::new(180, 60);
+        let _ = app.update(Message::EntriesLoaded(PageResult::new(
+            vec![entry; 60],
+            5000,
+            page,
+        )));
+        assert_eq!(app.selected_index, 20);
+        assert!(app.pending_window_start.is_none());
+        assert!(app.pending_selected_index.is_none());
+    }
+
+    #[test]
+    fn preview_loaded_sets_preview_and_ignores_stale_path() {
+        let (mut app, _dir) = app_with_entries(&["a.jpg", "b.jpg"]);
+        let path_a = app.entries.items[0].path.path().to_path_buf();
+        let _ = app.update(Message::PreviewLoaded(path_a.clone(), Some(vec![1, 2, 3])));
+        assert!(app.preview.is_some());
+        assert_eq!(app.preview.as_ref().unwrap().path, path_a);
+        // Un preview de otro archivo (la selección ya cambió)
+        // se ignora: no sustituye al actual.
+        let path_b = app.entries.items[1].path.path().to_path_buf();
+        let _ = app.update(Message::PreviewLoaded(path_b.clone(), Some(vec![9])));
+        assert_eq!(app.preview.as_ref().unwrap().path, path_a);
+        // Un fallo queda marcado para no reintentarlo.
+        let _ = app.update(Message::PreviewLoaded(path_a.clone(), None));
+        assert!(app.preview_failed.contains(&path_a));
     }
 
     #[test]

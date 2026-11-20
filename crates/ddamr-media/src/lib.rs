@@ -2,7 +2,7 @@
 //!
 //! El hash se calcula en streaming, en bloques de 128 KB: nunca se
 //! carga un archivo entero en memoria.
-use ddamr_core::{AppError, Result, SafePath};
+use ddamr_core::{AppError, MediaKind, Result, SafePath};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -187,8 +187,22 @@ pub fn blake3_file(path: &SafePath) -> Result<String> {
 /// No es una imagen → `Err`. Se rechazan cabeceras que declaren
 /// más de 100 megapíxeles para no reservar memoria desmedida.
 pub fn thumbnail(path: &SafePath, size_px: u32) -> Result<Vec<u8>> {
-    use std::io::Cursor;
+    thumbnail_sized(path, size_px)
+}
+
+/// Como [`thumbnail`], con el nombre que deja claro que el tamaño
+/// es el lado mayor máximo en píxeles.
+pub fn thumbnail_sized(path: &SafePath, max_side: u32) -> Result<Vec<u8>> {
     let img = image::open(path.path()).map_err(|e| AppError::Other(e.to_string()))?;
+    jpeg_thumbnail(&img, max_side)
+}
+
+/// Núcleo compartido: reduce `img` a una miniatura JPEG (calidad 80)
+/// con el lado mayor como máximo en `max_side` píxeles. Rechaza
+/// imágenes de más de 100 megapíxeles para no reservar memoria
+/// desmedida.
+fn jpeg_thumbnail(img: &image::DynamicImage, max_side: u32) -> Result<Vec<u8>> {
+    use std::io::Cursor;
     if img.width() as u64 * img.height() as u64 > 100_000_000 {
         return Err(AppError::Other(format!(
             "imagen demasiado grande: {}x{}",
@@ -196,7 +210,7 @@ pub fn thumbnail(path: &SafePath, size_px: u32) -> Result<Vec<u8>> {
             img.height()
         )));
     }
-    let thumb = image::imageops::thumbnail(&img, size_px, size_px);
+    let thumb = image::imageops::thumbnail(img, max_side, max_side);
     let mut out = Vec::new();
     {
         let mut cursor = Cursor::new(&mut out);
@@ -206,6 +220,68 @@ pub fn thumbnail(path: &SafePath, size_px: u32) -> Result<Vec<u8>> {
             .map_err(|e| AppError::Other(e.to_string()))?;
     }
     Ok(out)
+}
+
+/// Miniatura JPEG de un vídeo: extrae el frame al 25% de la
+/// duración (el mismo instante que usa `dhash_video`) y lo reduce
+/// con el mismo núcleo que las imágenes. Si ffmpeg no está, la
+/// duración no es válida o ffmpeg falla, error controlado
+/// (`AppError::Metadata`).
+pub fn video_thumbnail(path: &SafePath, max_side: u32) -> Result<Vec<u8>> {
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        return Err(AppError::Metadata("ffmpeg no disponible".into()));
+    }
+    let duration = video_duration_secs(path)?;
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err(AppError::Metadata(
+            "duración de vídeo inválida para miniatura".into(),
+        ));
+    }
+    let t = (duration * 0.25).min(duration - 0.25).max(0.0);
+    let tmp = std::env::temp_dir().join(format!("ddamr-vthumb-{}.png", std::process::id()));
+    extract_frame(path, t, &tmp, true)?;
+    if !tmp.exists() {
+        // Reintento con seek de salida, como en `dhash_video`.
+        extract_frame(path, t, &tmp, false)?;
+    }
+    let bytes = std::fs::read(&tmp).map_err(AppError::IoPlain)?;
+    let _ = std::fs::remove_file(&tmp);
+    let img = image::load_from_memory(&bytes).map_err(|e| AppError::Other(e.to_string()))?;
+    jpeg_thumbnail(&img, max_side)
+}
+
+/// Miniatura JPEG según el tipo de archivo: imagen → miniatura de
+/// la imagen; vídeo → frame al 25%; cualquier otro tipo →
+/// `AppError::Other("no es imagen ni vídeo")`.
+pub fn thumbnail_for_entry(path: &SafePath, kind: MediaKind, max_side: u32) -> Result<Vec<u8>> {
+    match kind {
+        MediaKind::Image => thumbnail_sized(path, max_side),
+        MediaKind::Video => video_thumbnail(path, max_side),
+        _ => Err(AppError::Other("no es imagen ni vídeo".into())),
+    }
+}
+
+/// Clave de caché para la miniatura de `path`: BLAKE3 en hex de
+/// (ruta canónica + mtime en milisegundos, separados por `'\0'`).
+/// Es estable mientras no cambie el archivo y cambia cuando se
+/// toca su mtime, sin leer el contenido.
+pub fn thumb_cache_key(path: &SafePath) -> Result<String> {
+    let canonical = std::fs::canonicalize(path.path()).map_err(|e| AppError::Io {
+        path: path.path().to_path_buf(),
+        source: e,
+    })?;
+    let mtime_ms = std::fs::metadata(path.path())
+        .map_err(AppError::IoPlain)?
+        .modified()
+        .map_err(AppError::IoPlain)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AppError::Other("mtime anterior a la época Unix".into()))?
+        .as_millis();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(canonical.as_os_str().as_encoded_bytes());
+    hasher.update(b"\0");
+    hasher.update(mtime_ms.to_string().as_bytes());
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(test)]
@@ -324,6 +400,115 @@ mod tests {
         let safe = SafePath::new(dir.path(), &video).unwrap();
         let hashes = dhash_video(&safe).unwrap();
         assert_eq!(hashes.len(), 5, "un dHash por porcentaje (2/25/50/75/98)");
+    }
+
+    #[test]
+    fn thumbnail_sized_respects_max_side() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foto.jpg");
+        image::RgbImage::new(400, 300).save(&path).unwrap();
+        let safe = SafePath::new(dir.path(), &path).unwrap();
+        let small = thumbnail_sized(&safe, 64).unwrap();
+        let big = thumbnail_sized(&safe, 320).unwrap();
+        for bytes in [&small, &big] {
+            assert!(bytes.starts_with(&[0xFF, 0xD8]));
+            assert!(bytes.ends_with(&[0xFF, 0xD9]));
+        }
+        let dec_small = image::load_from_memory(&small).unwrap();
+        let dec_big = image::load_from_memory(&big).unwrap();
+        assert!(dec_small.width() <= 64 && dec_small.height() <= 64);
+        assert!(dec_big.width() <= 320 && dec_big.height() <= 320);
+        assert!(
+            dec_big.width() > dec_small.width() && dec_big.height() > dec_small.height(),
+            "320 px debe dar una miniatura mayor que 64 px: {}x{} frente a {}x{}",
+            dec_big.width(),
+            dec_big.height(),
+            dec_small.width(),
+            dec_small.height()
+        );
+    }
+
+    #[test]
+    fn video_thumbnail_frame_or_controlled_error() {
+        // Mismo vídeo fixture que `dhash_video_five_frames_or_controlled_error`.
+        let dir = TempDir::new().unwrap();
+        let video = dir.path().join("test.mp4");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=64x64:rate=10",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                &video.display().to_string(),
+            ])
+            .output();
+        let Ok(out) = generated else {
+            // Sin ffmpeg: el error debe ser controlado, no un fallo.
+            let safe = SafePath::new(dir.path(), &video).unwrap();
+            assert!(video_thumbnail(&safe, 128).is_err());
+            return;
+        };
+        if !out.status.success() || !video.exists() {
+            eprintln!("no se pudo generar el vídeo fixture, test omitido");
+            return;
+        }
+        let safe = SafePath::new(dir.path(), &video).unwrap();
+        let bytes = video_thumbnail(&safe, 128).unwrap();
+        assert!(bytes.starts_with(&[0xFF, 0xD8]));
+        assert!(bytes.ends_with(&[0xFF, 0xD9]));
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.width() <= 128 && decoded.height() <= 128);
+    }
+
+    #[test]
+    fn thumbnail_for_entry_rejects_non_image_video() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("cancion.mp3");
+        std::fs::write(&audio, b"no es audio de verdad").unwrap();
+        let other = dir.path().join("doc.pdf");
+        std::fs::write(&other, b"no es un pdf").unwrap();
+        let sa = SafePath::new(dir.path(), &audio).unwrap();
+        let so = SafePath::new(dir.path(), &other).unwrap();
+        assert!(thumbnail_for_entry(&sa, MediaKind::Audio, 128).is_err());
+        assert!(thumbnail_for_entry(&so, MediaKind::Other, 128).is_err());
+        assert!(thumbnail_for_entry(&so, MediaKind::Dir, 128).is_err());
+        // Y una imagen sí pasa por la misma función.
+        let img_path = dir.path().join("foto.jpg");
+        image::RgbImage::new(200, 100).save(&img_path).unwrap();
+        let si = SafePath::new(dir.path(), &img_path).unwrap();
+        let bytes = thumbnail_for_entry(&si, MediaKind::Image, 64).unwrap();
+        assert!(bytes.starts_with(&[0xFF, 0xD8]));
+    }
+
+    #[test]
+    fn thumb_cache_key_stable_and_changes_with_mtime() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foto.jpg");
+        std::fs::write(&path, b"contenido").unwrap();
+        let safe = SafePath::new(dir.path(), &path).unwrap();
+        let key1 = thumb_cache_key(&safe).unwrap();
+        assert_eq!(key1.len(), 64);
+        assert_eq!(key1, thumb_cache_key(&safe).unwrap(), "estable");
+        // Tocar el archivo: si el mtime cambia, la clave cambia; si
+        // el sistema de archivos no registra el cambio, al menos
+        // dos llamadas seguidas deben coincidir.
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&path, b"contenido").unwrap();
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let key2 = thumb_cache_key(&safe).unwrap();
+        if after != before {
+            assert_ne!(key1, key2, "el mtime cambió, la clave debe cambiar");
+        } else {
+            assert_eq!(key2, thumb_cache_key(&safe).unwrap());
+        }
     }
 
     #[test]

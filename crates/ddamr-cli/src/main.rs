@@ -4,10 +4,10 @@
 //! entera) y `ddamr doctor` verifica DB, config y herramientas.
 //! Fase 2: `duplicates` lista los grupos por espacio total y
 //! `archive <archivo>...` archiva con SafeOp.
-use ddamr_core::{AppError, Config, SafePath, format_size};
+use ddamr_core::{AppError, Config, MediaKind, SafePath, format_size};
 use ddamr_fs::SafeOp;
 use ddamr_index::{DuplicateKind, find_duplicates_with_root};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,6 +33,13 @@ fn run(args: &[String]) -> i32 {
         }
         Some("doctor") => doctor(),
         Some("duplicates") => duplicates(),
+        Some("thumbs") => {
+            let dir = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_default());
+            thumbs(&dir)
+        }
         Some("archive") => {
             let files: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
             if files.is_empty() {
@@ -44,7 +51,7 @@ fn run(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!(
-                "uso: ddamr scan <dir> | ddamr index <dir> | ddamr doctor | ddamr duplicates | ddamr archive <archivo>..."
+                "uso: ddamr scan <dir> | ddamr index <dir> | ddamr doctor | ddamr duplicates | ddamr thumbs <dir> | ddamr archive <archivo>..."
             );
             2
         }
@@ -174,6 +181,117 @@ fn ym_from_ms(ms: i64) -> Option<(u32, u32)> {
     Some((year as u32, m as u32))
 }
 
+/// Directorio de caché de miniaturas: `DDAMR_THUMBS_DIR` si está
+/// definida (los tests la usan para no tocar el home real), si no
+/// `~/.cache/ddamr/thumbs`.
+fn thumbs_cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("DDAMR_THUMBS_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".cache").join("ddamr").join("thumbs"))
+        .unwrap_or_default()
+}
+
+/// `ddamr thumbs <dir>`: miniaturas de 256 px de las imágenes del
+/// directorio (no recursivo) en la caché. Devuelve 0 aunque fallen
+/// imágenes sueltas; 1 solo si el directorio no existe o no se
+/// puede leer.
+fn thumbs(dir: &Path) -> i32 {
+    if !dir.is_dir() || std::fs::read_dir(dir).is_err() {
+        eprintln!(
+            "error: {}: no es un directorio o no se puede leer",
+            dir.display()
+        );
+        return 1;
+    }
+    let (generated, existing, failed) = thumbs_dir(dir);
+    println!("miniaturas: {generated} generadas, {existing} ya existían, {failed} fallaron");
+    0
+}
+
+/// Lógica de `thumbs`, testeable: devuelve (generadas, ya existían,
+/// fallaron). Si un archivo de caché ya existe no se regenera. Las
+/// fallidas se informan por stderr con su ruta y el motivo.
+fn thumbs_dir(dir: &Path) -> (usize, usize, usize) {
+    let cache = thumbs_cache_dir();
+    if let Err(e) = std::fs::create_dir_all(&cache) {
+        eprintln!("error: no se pudo crear la caché {}: {e}", cache.display());
+        return (0, 0, 0);
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: no se pudo leer {}: {e}", dir.display());
+            return (0, 0, 0);
+        }
+    };
+    let mut generated = 0usize;
+    let mut existing = 0usize;
+    let mut failed = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "advertencia: no se pudo leer una entrada de {}: {e}",
+                    dir.display()
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let kind = path
+            .extension()
+            .map(|e| MediaKind::from_ext(&e.to_string_lossy()))
+            .unwrap_or(MediaKind::Other);
+        if kind != MediaKind::Image {
+            continue;
+        }
+        let safe = match SafePath::new(dir, &path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+        let key = match ddamr_media::thumb_cache_key(&safe) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+        let dest = cache.join(format!("{key}.jpg"));
+        if dest.exists() {
+            existing += 1;
+            continue;
+        }
+        match ddamr_media::thumbnail_sized(&safe, 256) {
+            Ok(bytes) => match std::fs::write(&dest, bytes) {
+                Ok(()) => generated += 1,
+                Err(e) => {
+                    eprintln!("{}: no se pudo escribir la caché: {e}", path.display());
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                failed += 1;
+            }
+        }
+    }
+    (generated, existing, failed)
+}
+
 fn scan(dir: &std::path::Path) -> i32 {
     let config = Config::default();
     let safe = match SafePath::new(&config.root_dir, dir) {
@@ -275,4 +393,67 @@ fn doctor() -> i32 {
     let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     println!("doctor: ok");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Los tests de thumbs tocan DDAMR_THUMBS_DIR (variable de
+    // entorno global): se serializan con este mutex para que no se
+    // pisen entre sí al correr en paralelo.
+    static THUMBS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_jpeg(path: &Path, w: u32, h: u32) {
+        image::RgbImage::new(w, h).save(path).unwrap();
+    }
+
+    #[test]
+    fn thumbs_dir_generates_then_reuses_cache() {
+        let _guard = THUMBS_ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        unsafe { std::env::set_var("DDAMR_THUMBS_DIR", cache.path()) };
+        write_jpeg(&dir.path().join("a.jpg"), 400, 300);
+        write_jpeg(&dir.path().join("b.png"), 200, 200);
+        std::fs::write(dir.path().join("nota.txt"), b"no es imagen").unwrap();
+        // No recursivo: esta imagen de un subdirectorio no se toca.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        write_jpeg(&sub.join("c.jpg"), 100, 100);
+
+        let (made, ex, fail) = thumbs_dir(dir.path());
+        assert_eq!(
+            (made, ex, fail),
+            (2, 0, 0),
+            "dos imágenes de nivel superior"
+        );
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 2);
+
+        let (made, ex, fail) = thumbs_dir(dir.path());
+        assert_eq!((made, ex, fail), (0, 2, 0), "la segunda vez ya existen");
+        unsafe { std::env::remove_var("DDAMR_THUMBS_DIR") };
+    }
+
+    #[test]
+    fn thumbs_dir_counts_failures() {
+        let _guard = THUMBS_ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        unsafe { std::env::set_var("DDAMR_THUMBS_DIR", cache.path()) };
+        // .jpg con contenido que no es imagen: falla, pero no aborta.
+        std::fs::write(dir.path().join("roto.jpg"), b"esto no es un jpeg").unwrap();
+        write_jpeg(&dir.path().join("buena.jpg"), 100, 100);
+
+        let (made, ex, fail) = thumbs_dir(dir.path());
+        assert_eq!((made, ex, fail), (1, 0, 1));
+        unsafe { std::env::remove_var("DDAMR_THUMBS_DIR") };
+    }
+
+    #[test]
+    fn thumbs_missing_dir_returns_one() {
+        assert_eq!(thumbs(Path::new("/definitivamente/no/existe/ddamr")), 1);
+    }
 }
